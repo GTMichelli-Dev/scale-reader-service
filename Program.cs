@@ -1,69 +1,149 @@
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using System; // for OperatingSystem
+using ScaleReaderService;
+using ScaleReaderService.Data;
 using ScaleReaderService.Models;
 using ScaleReaderService.Services;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.EventLog;
+using Microsoft.OpenApi.Models;
 
-HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
+var version = typeof(ScaleWorker).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
 
-// Logging: console + Windows Event Log (Windows only)
-builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(o =>
+var builder = WebApplication.CreateBuilder(args);
+
+// Suppress noisy EF Core command/query warnings
+builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Query", LogLevel.Error);
+
+// Windows Service support
+builder.Services.AddWindowsService(options =>
 {
-    o.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff ";
-    o.UseUtcTimestamp = false;
+    options.ServiceName = "BasicWeigh Scale Reader Service";
 });
 
+// SQLite database for scale configs and service settings
+var dbPath = Path.Combine(AppContext.BaseDirectory, "scalereaderservice.db");
+builder.Services.AddDbContext<ScaleDbContext>(options =>
+    options.UseSqlite($"Data Source={dbPath}"));
+
+// Load scale brand definitions from local first, then remote
+builder.Services.AddSingleton(sp =>
+{
+    var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("ScaleBrands");
+    var localPath = Path.Combine(AppContext.BaseDirectory, "scale-models.json");
+
+    // Load local first (fast), then try remote to update
+    var config = builder.Configuration.GetSection("Scale");
+    var brandsUrl = config["BrandsUrl"] ?? "";
+    var brandsToken = config["BrandsToken"] ?? "";
+
+    var brands = ScaleBrandDefinition.LoadBrandsAsync(brandsUrl, localPath, brandsToken, logger)
+        .GetAwaiter().GetResult();
+    return brands;
+});
+
+// HTTP client for calling web API
+builder.Services.AddHttpClient("BasicWeighApi", client =>
+{
+    var serverUrl = builder.Configuration["Scale:ServerUrl"] ?? "http://localhost:5110";
+    client.BaseAddress = new Uri(serverUrl);
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
+// SMA client (scale protocol handler)
+builder.Services.AddSingleton<SmaClient>();
+
+// Restart signal (triggered when settings change via API)
+builder.Services.AddSingleton<RestartSignal>();
+
+// Announce signal (triggered when scales change via API)
+builder.Services.AddSingleton<AnnounceSignal>();
+
+// In-memory weight store (latest reading per scale)
+builder.Services.AddSingleton<ScaleWeightStore>();
+
+// Controllers + Swagger
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Scale Reader Service API",
+        Version = "v1",
+        Description = "Health, status, configuration, and scale management endpoints for the Scale Reader Service."
+    });
+});
+
+// Background worker
+builder.Services.AddHostedService<ScaleWorker>();
+
+// Event Log on Windows
 if (OperatingSystem.IsWindows())
 {
-    builder.Logging.AddEventLog(settings =>
+    builder.Logging.AddEventLog(new EventLogSettings
     {
-        settings.SourceName = "ScaleReaderService";
-        settings.LogName = "Application";
+        SourceName = "ScaleReaderService"
     });
 }
 
-// === Options binding ===
-// NOTE: bind lists, not arrays
-builder.Services.Configure<PollingOptions>(builder.Configuration.GetSection("Polling"));
-builder.Services.Configure<SmaOptions>(builder.Configuration.GetSection("Sma"));
-builder.Services.Configure<List<EndpointOptions>>(builder.Configuration.GetSection("Endpoints"));
-builder.Services.Configure<List<ScaleOptions>>(builder.Configuration.GetSection("Scales"));
+var app = builder.Build();
 
-// HttpClient factory
-builder.Services.AddHttpClient("endpoints");
-
-// Services
-builder.Services.AddSingleton<SmaClient>();
-builder.Services.AddSingleton<ScalePoller>();
-
-// Hosted service that runs the poller
-builder.Services.AddHostedService(provider =>
+// Auto-create/migrate database
+using (var scope = app.Services.CreateScope())
 {
-    var poller = provider.GetRequiredService<ScalePoller>();
-    var log = provider.GetRequiredService<ILogger<BackgroundServiceImpl>>();
-    return new BackgroundServiceImpl(poller, log);
-});
+    var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
+    db.Database.EnsureCreated();
 
-await builder.Build().RunAsync();
-
-// Wrapper background service to drive the poller loop
-public class BackgroundServiceImpl : BackgroundService
-{
-    private readonly ScalePoller _poller;
-    private readonly ILogger<BackgroundServiceImpl> _log;
-
-    public BackgroundServiceImpl(ScalePoller poller, ILogger<BackgroundServiceImpl> log)
+    // Seed from appsettings.json if no scales exist yet
+    if (!db.Scales.Any())
     {
-        _poller = poller;
-        _log = log;
+        var scalesConfig = builder.Configuration.GetSection("Scales").Get<List<ScaleOptions>>();
+        if (scalesConfig != null)
+        {
+            foreach (var s in scalesConfig)
+            {
+                db.Scales.Add(new ScaleConfigEntity
+                {
+                    ScaleId = $"scale-{s.Id}",
+                    DisplayName = s.Description,
+                    ScaleBrand = "Generic SMA",
+                    IpAddress = s.IpAddress,
+                    Port = s.Port,
+                    Active = true
+                });
+            }
+            db.SaveChanges();
+        }
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    // Update settings from appsettings if ServerUrl changed
+    var settings = db.Settings.OrderBy(s => s.Id).FirstOrDefault();
+    if (settings != null)
     {
-        _log.LogInformation("ScaleReaderService starting.");
-        await _poller.RunAsync(stoppingToken);
-        _log.LogInformation("ScaleReaderService stopping.");
+        var configUrl = builder.Configuration["Scale:ServerUrl"];
+        if (!string.IsNullOrWhiteSpace(configUrl) && settings.ServerUrl == "http://localhost:5110")
+        {
+            settings.ServerUrl = configUrl;
+            db.SaveChanges();
+        }
     }
 }
+
+// Swagger
+app.UseSwagger();
+app.UseSwaggerUI(c =>
+{
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Scale Reader Service API v1");
+});
+
+app.MapControllers();
+
+// Startup banner
+var urls = builder.Configuration["Urls"] ?? "http://localhost:5220";
+var logger2 = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ScaleReaderService");
+logger2.LogInformation("============================================");
+logger2.LogInformation("  Scale Reader Service v{Version}", version);
+logger2.LogInformation("  Swagger: {Urls}/swagger", urls);
+logger2.LogInformation("============================================");
+
+await app.RunAsync();

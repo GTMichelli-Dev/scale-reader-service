@@ -1,129 +1,260 @@
-﻿using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using ScaleReaderService.Models;
+using Microsoft.Extensions.Logging;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace ScaleReaderService.Services
+namespace ScaleReaderService.Services;
+
+/// <summary>
+/// SMA (Scale Manufacturers Association) protocol client over TCP.
+/// Supports Weigh-Tronix ZM-301 and other SMA-compatible indicators.
+///
+/// SMA 8.1.2 Standard Scale Response Message:
+///   LF + s + r + n + m + f + xxxxxx.xxx + uuu + CR
+///
+///   s = Status:  ' '=normal, 'Z'=Center of Zero, 'O'=Over Capacity,
+///                'U'=Under Capacity, 'E'=Zero Error, 'T'=Tare Error
+///   r = Range:   '1' (multi-interval range, always '1' if disabled)
+///   n = Net/Gross: 'G'=Gross, 'T'=Tare, 'N'=Net
+///   m = Motion:  'M'=in motion, ' '=stable
+///   f = Future:  ' ' (always space)
+///   xxxxxx.xxx = Weight value (right-justified, space-padded)
+///   uuu = Unit of measure (e.g. " lb", " kg")
+/// </summary>
+public sealed class SmaClient
 {
-    /// <summary>
-    /// Minimal SMA-over-TCP client: sends a request command and parses the reply.
-    /// Parser is tolerant and extracts:
-    ///   - Weight (int, scaled to units of whole weight; adjust if you need decimals)
-    ///   - Motion (true if line indicates motion/unstable)
-    ///   - Ok (true when a valid weight was parsed and no explicit error tokens present)
-    ///   - Status (raw response)
-    /// </summary>
-    public sealed class SmaClient
+    private readonly ILogger<SmaClient> _log;
+    private static readonly Regex WeightRegex = new(@"(-?\d+(?:\.\d+)?)", RegexOptions.Compiled);
+
+    public SmaClient(ILogger<SmaClient> log)
     {
-        private readonly SmaOptions _sma;
-        private readonly PollingOptions _poll;
-        private readonly ILogger<SmaClient> _log;
-        private readonly Encoding _enc;
+        _log = log;
+    }
 
-        // Heuristic regex: finds the last integer in the line (common for gross/net)
-        private static readonly Regex WeightRegex = new(@"\s*(-?\d+)(?:\.\d+)?\s*", RegexOptions.Compiled);
+    public async Task<(bool ok, int weight, bool motion, string status, string rawText, string rawHex)> QueryOnceAsync(
+        string ip, int port, string? requestCommand, int timeoutMs, CancellationToken ct)
+    {
+        var command = string.IsNullOrWhiteSpace(requestCommand) ? "W\r\n" : requestCommand;
 
-        public SmaClient(IOptions<SmaOptions> sma, IOptions<PollingOptions> poll, ILogger<SmaClient> log)
+        using var client = new TcpClient();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeoutMs > 0 ? timeoutMs : 2000);
+
+        await client.ConnectAsync(ip, port, cts.Token);
+        client.ReceiveTimeout = timeoutMs;
+        client.SendTimeout = timeoutMs;
+
+        using NetworkStream ns = client.GetStream();
+
+        // Send request
+        byte[] request = BuildRequestBytes(command);
+        await ns.WriteAsync(request.AsMemory(0, request.Length), cts.Token);
+        await ns.FlushAsync(ct);
+
+        // Read raw response
+        var rawBuffer = new List<byte>();
+        var buffer = new byte[256];
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs > 0 ? timeoutMs : 2000);
+
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
         {
-            _sma = sma.Value;
-            _poll = poll.Value;
-            _log = log;
-            _enc = string.Equals(_sma.Encoding, "utf-8", StringComparison.OrdinalIgnoreCase)
-                 ? Encoding.UTF8
-                 : Encoding.ASCII;
+            if (ns.DataAvailable)
+            {
+                int bytesRead = await ns.ReadAsync(buffer, cts.Token);
+                if (bytesRead <= 0) break;
+                for (int i = 0; i < bytesRead; i++)
+                    rawBuffer.Add(buffer[i]);
+
+                // SMA response ends with CR (0x0D)
+                if (rawBuffer.Contains(0x0D)) break;
+            }
+            else
+            {
+                await Task.Delay(10, ct);
+            }
         }
 
-        public async Task<(bool ok, int weight, bool motion, string status)> QueryOnceAsync(string ip, int port, CancellationToken ct)
+        string rawHex = BitConverter.ToString(rawBuffer.ToArray());
+
+        if (rawBuffer.Count == 0)
         {
-            using var client = new TcpClient();
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(_poll.TimeoutMs);
+            return (false, 0, false, "No response", "", "");
+        }
 
-            await client.ConnectAsync(ip, port, cts.Token);
-            client.ReceiveTimeout = _poll.TimeoutMs;
-            client.SendTimeout = _poll.TimeoutMs;
+        // Convert to string for parsing, strip LF and CR
+        string raw = Encoding.ASCII.GetString(rawBuffer.ToArray());
+        string rawText = raw.Replace("\n", "<LF>").Replace("\r", "<CR>");
+        string reply = raw.TrimStart('\n', '\r').TrimEnd('\n', '\r');
 
-            using NetworkStream ns = client.GetStream();
+        _log.LogDebug("SMA raw ({Count} bytes): hex={Hex} text='{Reply}'",
+            rawBuffer.Count, rawHex, reply);
 
-            // Send request
-            byte[] request = BuildRequestBytes(_sma.RequestCommand);
-            await ns.WriteAsync(request.AsMemory(0, request.Length), cts.Token);
-            await ns.FlushAsync(ct);
-
-            // Read response (read until CR/LF or socket idle)
-            var buffer = new byte[1024];
-            var sb = new StringBuilder();
-            int bytesRead;
-            do
+        // ZM-301 response format (after LF/CR stripped):
+        //   [echo/pad][status][range][gross/net][motion][future][weight][unit]
+        // Find the SMA header by locating the pattern: status + digit(range) + G/N/T
+        int headerStart = FindSmaHeader(reply);
+        if (headerStart >= 0)
+        {
+            string smaData = reply.Substring(headerStart);
+            _log.LogDebug("SMA header found at position {Pos}, data='{Data}'", headerStart, smaData);
+            if (smaData.Length >= 7)
             {
-                if (ns.DataAvailable)
-                {
-                    bytesRead = await ns.ReadAsync(buffer, 0, buffer.Length, cts.Token);
-                    if (bytesRead <= 0) break;
-                    sb.Append(_enc.GetString(buffer, 0, bytesRead));
-                    if (sb.ToString().Contains("\n") || sb.ToString().Contains("\r")) break;
-                }
-                else
-                {
-                    // short pause to allow device to respond
-                    await Task.Delay(10, ct);
-                }
+                var (ok, weight, motion, status) = ParseSmaResponse(smaData);
+                return (ok, weight, motion, status, rawText, rawHex);
             }
-            while (!ct.IsCancellationRequested);
+        }
 
-            string reply = sb.ToString().Trim();
-            if (string.IsNullOrWhiteSpace(reply))
-            {
-                return (false, 0, false, "No response");
-            }
+        // Fallback for short/non-standard responses
+        var fb = ParseFallback(reply);
+        return (fb.ok, fb.weight, fb.motion, fb.status, rawText, rawHex);
+    }
 
-            // Parse motion/status tokens commonly seen in SMA-like outputs:
-            // Examples: "ST,GS,   000123 kg", "US,GS,000123", "MOTION", "STABLE"
-            bool motion = reply.Contains("US", StringComparison.OrdinalIgnoreCase)
-                       || reply.Contains("M", StringComparison.OrdinalIgnoreCase)
-                        || reply.Contains("UNST", StringComparison.OrdinalIgnoreCase)
-                       || reply.Contains("MOTION", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Parse SMA 8.1.2 standard response: s r n m f xxxxxx.xxx uuu
+    /// </summary>
+    private (bool ok, int weight, bool motion, string status) ParseSmaResponse(string reply)
+    {
+        // Position 0: s = Status
+        char statusChar = reply[0];
+        // Position 1: r = Range (ignore)
+        // Position 2: n = Gross/Net/Tare
+        char grossNet = reply.Length > 2 ? reply[2] : ' ';
+        // Position 3: m = Motion
+        char motionChar = reply.Length > 3 ? reply[3] : ' ';
+        // Position 4: f = Future (ignore)
+        // Position 5+: weight + unit
+        string weightPart = reply.Length > 5 ? reply.Substring(5) : "";
 
-            var m = WeightRegex.Matches(reply);
-            int weight = 0;
-            bool ok = false;
-            if (m.Count > 0)
-            {
-                // take the last numeric token as gross (devices often include headings + weight)
-                if (int.TryParse(m[^1].Groups[1].Value, out int parsed))
-                {
-                    weight = parsed;
-                    ok = true;
-                }
-            }
+        // Parse motion
+        bool motion = motionChar == 'M';
 
-            // Additional failure tokens
-            if (reply.Contains("ERR", StringComparison.OrdinalIgnoreCase)
-                || reply.Contains("U", StringComparison.OrdinalIgnoreCase)
-                        || reply.Contains("O", StringComparison.OrdinalIgnoreCase)
-                       || reply.Contains("E", StringComparison.OrdinalIgnoreCase))
+        // Parse status
+        bool ok = true;
+        string status;
+
+        switch (statusChar)
+        {
+            case 'O':
                 ok = false;
-            var status = (!ok) ? "Error" : (motion ? "Motion" : "Ok");
+                status = "Over Capacity";
+                break;
+            case 'U':
+                ok = false;
+                status = "Under Capacity";
+                break;
+            case 'E':
+                ok = false;
+                status = "Zero Error";
+                break;
+            case 'T':
+                ok = false;
+                status = "Tare Error";
+                break;
+            case 'Z':
+                status = motion ? "Motion" : ">0<";
+                break;
+            default: // space = normal
+                status = motion ? "Motion" : "Ok";
+                break;
+        }
+
+        // Validate gross mode — must be 'G' for weighing operations
+        if (ok && char.ToUpper(grossNet) != 'G')
+        {
+            ok = false;
+            status = "Not Gross Mode";
+            return (ok, 0, motion, status);
+        }
+
+        // Parse weight value from remaining string
+        int weight = 0;
+        var m = WeightRegex.Match(weightPart);
+        if (m.Success && double.TryParse(m.Groups[1].Value, out double parsed))
+        {
+            weight = (int)Math.Round(parsed);
+        }
+
+        // Validate units — must contain 'LB'
+        string unitPart = weightPart.ToUpper();
+        if (ok && !unitPart.Contains("LB"))
+        {
+            ok = false;
+            status = "Wrong Units";
             return (ok, weight, motion, status);
         }
 
-        private byte[] BuildRequestBytes(string s)
+        // Build display status
+        status = motion ? "Motion" : "Ok";
+
+        _log.LogDebug("SMA parsed: status='{Status}' range='{Range}' mode='{Mode}' motion={Motion} weight={Weight}",
+            statusChar, reply.Length > 1 ? reply[1] : ' ', grossNet, motion, weight);
+
+        return (ok, weight, motion, status);
+    }
+
+    /// <summary>
+    /// Fallback parser for non-standard or short responses.
+    /// </summary>
+    private (bool ok, int weight, bool motion, string status) ParseFallback(string reply)
+    {
+        bool motion = reply.Contains("M") || reply.Contains("US", StringComparison.OrdinalIgnoreCase)
+                   || reply.Contains("MOTION", StringComparison.OrdinalIgnoreCase);
+
+        var matches = WeightRegex.Matches(reply);
+        int weight = 0;
+        bool ok = false;
+
+        if (matches.Count > 0)
         {
-            // Support escape forms like \u0005 (ENQ) and \r\n
-            s = s
-                .Replace("\\r", "\r")
-                .Replace("\\n", "\n");
-
-            // \uXXXX support
-            s = Regex.Replace(s, @"\\u([0-9A-Fa-f]{4})", match =>
+            var lastMatch = matches[matches.Count - 1];
+            if (double.TryParse(lastMatch.Groups[1].Value, out double parsed))
             {
-                var code = Convert.ToInt32(match.Groups[1].Value, 16);
-                return char.ConvertFromUtf32(code);
-            });
-
-            return _enc.GetBytes(s);
+                weight = (int)Math.Round(parsed);
+                ok = true;
+            }
         }
+
+        if (reply.Contains("ERR", StringComparison.OrdinalIgnoreCase) ||
+            reply.Contains("OL", StringComparison.OrdinalIgnoreCase))
+        {
+            ok = false;
+        }
+
+        string status = !ok ? "Error" : (motion ? "Motion" : "Ok");
+        return (ok, weight, motion, status);
+    }
+
+    /// <summary>
+    /// Find the start of the SMA header in the response.
+    /// Looks for pattern: [status][digit][G/N/T] where status is space/O/U/E/Z/T
+    /// and digit is the range number, followed by G(ross)/N(et)/T(are).
+    /// </summary>
+    private static int FindSmaHeader(string reply)
+    {
+        for (int i = 0; i <= reply.Length - 5; i++)
+        {
+            char s = reply[i];      // status
+            char r = reply[i + 1];  // range (digit)
+            char n = reply[i + 2];  // gross/net/tare
+
+            bool validStatus = s == ' ' || s == 'O' || s == 'U' || s == 'E' || s == 'Z' || s == 'T';
+            bool validRange = char.IsDigit(r);
+            bool validMode = n == 'G' || n == 'N' || n == 'T';
+
+            if (validStatus && validRange && validMode)
+                return i;
+        }
+        return -1;
+    }
+
+    private static byte[] BuildRequestBytes(string s)
+    {
+        s = s.Replace("\\r", "\r").Replace("\\n", "\n");
+        s = Regex.Replace(s, @"\\u([0-9A-Fa-f]{4})", match =>
+        {
+            var code = Convert.ToInt32(match.Groups[1].Value, 16);
+            return char.ConvertFromUtf32(code);
+        });
+        return Encoding.ASCII.GetBytes(s);
     }
 }
