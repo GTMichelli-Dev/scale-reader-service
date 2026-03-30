@@ -4,11 +4,15 @@
 # =============================================================================
 # Run directly on the target machine:
 #
-#   curl -sSL https://raw.githubusercontent.com/GTMichelli-Dev/scale-reader-service/main/deploy/install.sh | bash -s -- <web-server-url>
+#   git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
+#   bash /tmp/srs/deploy/install.sh <web-server-url>
+#   rm -rf /tmp/srs
 #
 # Examples:
-#   curl -sSL https://raw.githubusercontent.com/GTMichelli-Dev/scale-reader-service/main/deploy/install.sh | bash -s -- http://basicscale.scaledata.net
-#   curl -sSL https://raw.githubusercontent.com/GTMichelli-Dev/scale-reader-service/main/deploy/install.sh | bash -s -- http://basicscale.scaledata.net --service-id plant-1 --port 5220
+#   git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
+#   bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net
+#   bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net --service-id plant-1 --port 5220
+#   rm -rf /tmp/srs
 #
 # To update an existing install, run the same command again — it will
 # stop the service, update files, preserve the database, and restart.
@@ -67,7 +71,8 @@ if [ -z "$WEB_URL" ]; then
     echo "ERROR: Web server URL is required."
     echo ""
     echo "Usage:"
-    echo "  curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/${BRANCH}/deploy/install.sh | bash -s -- http://your-server:5110"
+    echo "  git clone https://github.com/${GITHUB_REPO}.git /tmp/srs"
+    echo "  bash /tmp/srs/deploy/install.sh http://your-server:5110"
     echo ""
     echo "Run with --help for all options."
     exit 1

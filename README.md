@@ -36,17 +36,23 @@ Scale protocol definitions can be loaded from the [device-definitions](https://g
 
 ### Quick Install (Linux / Raspberry Pi)
 
-Run this on the target machine:
+SSH into the target machine and run:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/GTMichelli-Dev/scale-reader-service/main/deploy/install.sh | bash -s -- http://your-basicweigh-server:5110
+git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
+bash /tmp/srs/deploy/install.sh http://your-basicweigh-server:5110
+rm -rf /tmp/srs
 ```
 
 With options:
 ```bash
-curl -sSL https://raw.githubusercontent.com/GTMichelli-Dev/scale-reader-service/main/deploy/install.sh | bash -s -- http://basicscale.scaledata.net \
+git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
+bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net \
     --service-id plant-1 --port 5220
+rm -rf /tmp/srs
 ```
+
+For private repos, git will prompt for credentials. You can also use a deploy key or GitHub token.
 
 Options:
 | Option | Default | Description |
