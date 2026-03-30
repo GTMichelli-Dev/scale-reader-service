@@ -168,33 +168,23 @@ if dotnet --list-sdks 2>/dev/null | grep -q "8\."; then
 fi
 
 if [ "$HAS_SDK" = true ]; then
-    echo "  Building with local SDK..."
-    dotnet publish "${CLONE_DIR}/ScaleReaderService.csproj" \
-        -c Release \
-        -r "${RID}" \
-        --self-contained true \
-        -o "${INSTALL_DIR}" \
-        -p:PublishSingleFile=false \
-        -p:PublishTrimmed=false
+    echo "  .NET SDK already installed."
 else
-    echo "  Installing .NET SDK for build..."
-    SDK_DIR=$(mktemp -d)
+    echo "  Installing .NET SDK permanently (reused on future updates)..."
     curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin \
         --channel ${DOTNET_CHANNEL} \
-        --install-dir "$SDK_DIR"
-
-    echo "  Building..."
-    "$SDK_DIR/dotnet" publish "${CLONE_DIR}/ScaleReaderService.csproj" \
-        -c Release \
-        -r "${RID}" \
-        --self-contained true \
-        -o "${INSTALL_DIR}" \
-        -p:PublishSingleFile=false \
-        -p:PublishTrimmed=false
-
-    # Clean up SDK
-    rm -rf "$SDK_DIR"
+        --install-dir "$DOTNET_ROOT"
+    echo "  .NET SDK installed to $DOTNET_ROOT"
 fi
+
+echo "  Building..."
+dotnet publish "${CLONE_DIR}/ScaleReaderService.csproj" \
+    -c Release \
+    -r "${RID}" \
+    --self-contained true \
+    -o "${INSTALL_DIR}" \
+    -p:PublishSingleFile=false \
+    -p:PublishTrimmed=false
 
 rm -rf "${CLONE_DIR}"
 

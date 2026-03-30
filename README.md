@@ -64,11 +64,13 @@ Options:
 
 The install script will:
 1. Detect system architecture (ARM64, ARM, x64)
-2. Install .NET 8 ASP.NET Core runtime (if not present)
+2. Install .NET 8 SDK and runtime permanently (skips download on future updates)
 3. Clone and build the service from GitHub
 4. Configure the web server URL
 5. Set up a systemd service that starts on boot
 6. Preserve existing database on updates
+
+**Prerequisites:** Just internet access and `git`. No .NET needed — the script installs everything. The .NET SDK is installed permanently so future updates skip the download.
 
 ### Run as console app (Windows or Linux)
 
