@@ -232,7 +232,7 @@ Description=Scale Reader Service
 After=network.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=${EXEC}
 WorkingDirectory=${INSTALL_DIR}
 Restart=always

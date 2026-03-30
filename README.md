@@ -40,7 +40,7 @@ SSH into the target machine and run:
 
 ```bash
 git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
-bash /tmp/srs/deploy/install.sh https://your-basicweigh-server
+bash /tmp/srs/deploy/install.sh your-basicweigh-server
 rm -rf /tmp/srs
 ```
 
