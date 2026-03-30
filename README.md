@@ -40,14 +40,14 @@ SSH into the target machine and run:
 
 ```bash
 git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
-bash /tmp/srs/deploy/install.sh http://your-basicweigh-server:5110
+bash /tmp/srs/deploy/install.sh https://your-basicweigh-server
 rm -rf /tmp/srs
 ```
 
 With options:
 ```bash
 git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
-bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net \
+bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net \
     --service-id plant-1 --port 5220
 rm -rf /tmp/srs
 ```
@@ -94,7 +94,7 @@ All configuration is done via the Swagger API at `http://<your-ip>:<port>/swagge
 | Setting | Description |
 |---------|-------------|
 | `serviceId` | Unique ID for this service instance (used by the web app to identify it) |
-| `serverUrl` | BasicWeigh web server URL (e.g., `http://basicscale.scaledata.net`) |
+| `serverUrl` | BasicWeigh web server URL (e.g., `https://basicscale.scaledata.net`) |
 | `signalRHub` | SignalR hub path (default: `/scaleHub`) |
 | `brandsUrl` | URL to remote scale-models.json for protocol definitions |
 | `brandsToken` | GitHub token for private repos (optional) |
