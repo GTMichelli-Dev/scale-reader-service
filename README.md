@@ -59,7 +59,7 @@ Options:
 |--------|---------|-------------|
 | `--service-id <id>` | `default` | Unique ID for this service instance |
 | `--port <port>` | `5220` | Swagger API port |
-| `--branch <branch>` | `main` | Git branch to install |
+| `--branch <branch>` | `master` | Git branch to install |
 | `--install-dir <path>` | `/opt/scale-reader-service` | Install location |
 
 The install script will:

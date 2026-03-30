@@ -27,7 +27,7 @@ INSTALL_DIR="/opt/scale-reader-service"
 SERVICE_NAME="scale-reader-service"
 DOTNET_CHANNEL="8.0"
 GITHUB_REPO="GTMichelli-Dev/scale-reader-service"
-BRANCH="main"
+BRANCH="master"
 WEB_URL=""
 
 # ---- Parse arguments ----
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --service-id <id>      Unique ID for this service (default: default)"
             echo "  --port <port>          API port (default: 5220)"
-            echo "  --branch <branch>      Git branch to install (default: main)"
+            echo "  --branch <branch>      Git branch to install (default: master)"
             echo "  --install-dir <path>   Install location (default: /opt/scale-reader-service)"
             echo "  --help                 Show this help"
             exit 0
