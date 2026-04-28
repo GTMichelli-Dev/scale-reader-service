@@ -4,31 +4,69 @@ using Microsoft.Extensions.Logging;
 
 namespace ScaleReaderService.Models;
 
+/// <summary>
+/// Definition of a scale brand/model from scale-models.json. The shape mirrors the JSON file —
+/// any field not present in the JSON deserializes as null/0 and is omitted in API responses.
+/// </summary>
 public class ScaleBrandDefinition
 {
     [JsonPropertyName("brand")]
     public string Brand { get; set; } = "";
 
-    [JsonPropertyName("protocol")]
-    public string Protocol { get; set; } = "";
+    [JsonPropertyName("model")]
+    public string? Model { get; set; }
 
-    [JsonPropertyName("connectionType")]
-    public string ConnectionType { get; set; } = "TCP";
+    /// <summary>Connection type: "TCP" or "Serial"</summary>
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
+
+    /// <summary>Wire-level protocol: "Continuous", "Demand", "IQ355", "SDS", etc.</summary>
+    [JsonPropertyName("protocol")]
+    public string? Protocol { get; set; }
+
+    // ---- Serial defaults ----
+
+    [JsonPropertyName("baudRate")]
+    public int? BaudRate { get; set; }
+
+    [JsonPropertyName("dataBits")]
+    public int? DataBits { get; set; }
+
+    [JsonPropertyName("parity")]
+    public string? Parity { get; set; }
+
+    [JsonPropertyName("stopBits")]
+    public int? StopBits { get; set; }
+
+    // ---- TCP defaults ----
 
     [JsonPropertyName("defaultPort")]
-    public int DefaultPort { get; set; } = 10001;
+    public int? DefaultPort { get; set; }
 
-    [JsonPropertyName("requestCommand")]
-    public string RequestCommand { get; set; } = "W\r\n";
+    // ---- Protocol details ----
 
-    [JsonPropertyName("encoding")]
-    public string Encoding { get; set; } = "ascii";
+    /// <summary>Demand-mode command sent to request a weight reading.</summary>
+    [JsonPropertyName("demandCommand")]
+    public string? DemandCommand { get; set; }
 
-    [JsonPropertyName("description")]
-    public string Description { get; set; } = "";
+    /// <summary>Print command (sent over the connection to trigger the scale's print function).</summary>
+    [JsonPropertyName("printCommand")]
+    public string? PrintCommand { get; set; }
+
+    /// <summary>Zero command for the scale.</summary>
+    [JsonPropertyName("zeroCommand")]
+    public string? ZeroCommand { get; set; }
+
+    /// <summary>Mettler Toledo SDS shared-data item name (e.g. "Weight.Net").</summary>
+    [JsonPropertyName("sdsSharedDataName")]
+    public string? SdsSharedDataName { get; set; }
+
+    /// <summary>Regex to extract weight (and unit) from the response line.</summary>
+    [JsonPropertyName("weightRegex")]
+    public string? WeightRegex { get; set; }
 
     [JsonPropertyName("notes")]
-    public string Notes { get; set; } = "";
+    public string? Notes { get; set; }
 
     /// <summary>
     /// Loads brand definitions from a remote URL first, falling back to local file.

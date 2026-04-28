@@ -133,6 +133,17 @@ public class ScaleWorker : BackgroundService
 
     private void RegisterHandlers()
     {
+        // Web app can request the loaded brand definitions list
+        _connection!.On("GetScaleBrands", async () =>
+        {
+            try
+            {
+                var brands = _sp.GetService<List<ScaleBrandDefinition>>() ?? new List<ScaleBrandDefinition>();
+                await _connection!.InvokeAsync("ScaleBrandsResponse", brands);
+            }
+            catch (Exception ex) { _log.LogWarning("GetScaleBrands failed: {Msg}", ex.Message); }
+        });
+
         // Web app can request scale list
         _connection!.On("GetScaleList", async () =>
         {
@@ -146,8 +157,13 @@ public class ScaleWorker : BackgroundService
                     serviceId = _serviceId,
                     scales = scales.Select(s => new
                     {
-                        s.ScaleId, s.DisplayName, s.ScaleBrand, s.IpAddress,
-                        s.Port, s.Active, s.PollingIntervalMs
+                        s.ScaleId, s.DisplayName, s.ScaleBrand,
+                        s.ConnectionType, s.Protocol,
+                        s.IpAddress, s.Port,
+                        s.SerialPortName, s.BaudRate, s.DataBits, s.Parity, s.StopBits,
+                        s.RequestCommand,
+                        s.PollingIntervalMs, s.TimeoutMs,
+                        s.Active
                     })
                 });
             }
@@ -308,8 +324,13 @@ public class ScaleWorker : BackgroundService
                 scaleCount = scales.Count,
                 scales = scales.Select(s => new
                 {
-                    s.ScaleId, s.DisplayName, s.ScaleBrand, s.IpAddress,
-                    s.Port, s.Active
+                    s.ScaleId, s.DisplayName, s.ScaleBrand,
+                    s.ConnectionType, s.Protocol,
+                    s.IpAddress, s.Port,
+                    s.SerialPortName, s.BaudRate, s.DataBits, s.Parity, s.StopBits,
+                    s.RequestCommand,
+                    s.PollingIntervalMs, s.TimeoutMs,
+                    s.Active
                 })
             });
 
