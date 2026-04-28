@@ -106,17 +106,18 @@ public sealed class SerialScaleClient
     /// Parses an IQ355 frame. Format observed on Cardinal 225 Navigator:
     ///   "   8980 LB G    "   stable
     ///   "   8860 LB G MO "   in motion
-    /// First whitespace-separated token is the integer weight; remaining tokens carry units, mode,
-    /// and an optional "MO" motion flag.
+    ///   "-    20 LB G BZ "   below zero (sign in its own column)
+    /// Status flags appear as 2-char tokens after the mode (G/N/T):
+    ///   MO = motion, BZ = below zero, ZR = at zero,
+    ///   OL = overload, UR = under-range, ER = indicator error.
     /// </summary>
     public static SerialFrame ParseIq355(string line)
     {
         var frame = new SerialFrame();
 
         var upper = line.ToUpperInvariant();
-        bool motion = upper.Contains("MO");
-
         var tokens = upper.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
         if (tokens.Length == 0)
         {
             frame.Ok = false;
@@ -124,12 +125,30 @@ public sealed class SerialScaleClient
             return frame;
         }
 
-        if (!int.TryParse(tokens[0], out int weight))
+        // Status flags as discrete tokens (avoids substring false positives inside LB/KG/etc.)
+        bool motion     = tokens.Any(t => t == "MO");
+        bool belowZero  = tokens.Any(t => t == "BZ");
+        bool atZero     = tokens.Any(t => t == "ZR");
+        bool overload   = tokens.Any(t => t == "OL");
+        bool underRange = tokens.Any(t => t == "UR");
+        bool errorFlag  = tokens.Any(t => t == "ER");
+
+        // The sign can appear in its own column with padding spaces between '-' and digits.
+        int weightTokenIdx = 0;
+        bool negative = false;
+        if (tokens[0] == "-")
+        {
+            negative = true;
+            weightTokenIdx = 1;
+        }
+
+        if (weightTokenIdx >= tokens.Length || !int.TryParse(tokens[weightTokenIdx], out int weight))
         {
             frame.Ok = false;
             frame.Status = "Parse error";
             return frame;
         }
+        if (negative) weight = -weight;
 
         bool hasLb = tokens.Any(t => t == "LB");
         bool hasKg = tokens.Any(t => t == "KG");
@@ -143,7 +162,7 @@ public sealed class SerialScaleClient
         }
 
         char mode = ' ';
-        for (int i = 1; i < tokens.Length; i++)
+        for (int i = weightTokenIdx + 1; i < tokens.Length; i++)
         {
             if (tokens[i] is "G" or "N" or "T") { mode = tokens[i][0]; break; }
         }
@@ -159,8 +178,17 @@ public sealed class SerialScaleClient
 
         frame.Weight = weight;
         frame.Motion = motion;
-        frame.Ok = true;
-        frame.Status = motion ? "Motion" : "Ok";
+
+        // Map IQ355 flags to the user-facing status. BZ and ZR are informational —
+        // the reading is still valid, so ok stays true.
+        if (overload)        { frame.Ok = false; frame.Status = "Overload"; }
+        else if (underRange) { frame.Ok = false; frame.Status = "Under-Range"; }
+        else if (errorFlag)  { frame.Ok = false; frame.Status = "Indicator Error"; }
+        else if (belowZero)  { frame.Ok = true;  frame.Status = motion ? "Motion" : "Below Zero"; }
+        else if (atZero)     { frame.Ok = true;  frame.Status = motion ? "Motion" : ">0<"; }
+        else if (motion)     { frame.Ok = true;  frame.Status = "Motion"; }
+        else                 { frame.Ok = true;  frame.Status = "Ok"; }
+
         return frame;
     }
 
