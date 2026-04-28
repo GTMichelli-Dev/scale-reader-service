@@ -52,6 +52,9 @@ builder.Services.AddHttpClient("BasicWeighApi", client =>
 // SMA client (scale protocol handler)
 builder.Services.AddSingleton<SmaClient>();
 
+// Serial (RS-232) scale client — IQ355 streaming format
+builder.Services.AddSingleton<SerialScaleClient>();
+
 // Restart signal (triggered when settings change via API)
 builder.Services.AddSingleton<RestartSignal>();
 
@@ -93,6 +96,16 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
     db.Database.EnsureCreated();
+
+    // Add columns introduced after the initial schema. EnsureCreated() does not migrate
+    // existing tables, so we need to add new fields by hand for upgrades.
+    AddColumnIfMissing(db, "Scales", "ConnectionType", "TEXT NOT NULL DEFAULT 'TCP'");
+    AddColumnIfMissing(db, "Scales", "Protocol", "TEXT NOT NULL DEFAULT 'SMA'");
+    AddColumnIfMissing(db, "Scales", "SerialPortName", "TEXT NULL");
+    AddColumnIfMissing(db, "Scales", "BaudRate", "INTEGER NOT NULL DEFAULT 9600");
+    AddColumnIfMissing(db, "Scales", "DataBits", "INTEGER NOT NULL DEFAULT 8");
+    AddColumnIfMissing(db, "Scales", "Parity", "TEXT NOT NULL DEFAULT 'None'");
+    AddColumnIfMissing(db, "Scales", "StopBits", "INTEGER NOT NULL DEFAULT 1");
 
     // Seed from appsettings.json if no scales exist yet
     if (!db.Scales.Any())
@@ -147,3 +160,25 @@ logger2.LogInformation("  Swagger: {Urls}/swagger", urls);
 logger2.LogInformation("============================================");
 
 await app.RunAsync();
+
+static void AddColumnIfMissing(ScaleDbContext db, string table, string column, string definition)
+{
+    var conn = db.Database.GetDbConnection();
+    if (conn.State != System.Data.ConnectionState.Open) conn.Open();
+
+    using (var check = conn.CreateCommand())
+    {
+        check.CommandText = $"PRAGMA table_info({table});";
+        using var reader = check.ExecuteReader();
+        while (reader.Read())
+        {
+            // PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+    }
+
+    using var alter = conn.CreateCommand();
+    alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+    alter.ExecuteNonQuery();
+}

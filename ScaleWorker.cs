@@ -13,6 +13,7 @@ public class ScaleWorker : BackgroundService
     private readonly RestartSignal _restart;
     private readonly AnnounceSignal _announce;
     private readonly SmaClient _smaClient;
+    private readonly SerialScaleClient _serialClient;
     private readonly ScaleWeightStore _weightStore;
     private HubConnection? _connection;
     private string _serviceId = "default";
@@ -23,6 +24,7 @@ public class ScaleWorker : BackgroundService
         RestartSignal restart,
         AnnounceSignal announce,
         SmaClient smaClient,
+        SerialScaleClient serialClient,
         ScaleWeightStore weightStore)
     {
         _sp = sp;
@@ -30,6 +32,7 @@ public class ScaleWorker : BackgroundService
         _restart = restart;
         _announce = announce;
         _smaClient = smaClient;
+        _serialClient = serialClient;
         _weightStore = weightStore;
     }
 
@@ -235,8 +238,15 @@ public class ScaleWorker : BackgroundService
                 {
                     existing.DisplayName = update.DisplayName ?? existing.DisplayName;
                     existing.ScaleBrand = update.ScaleBrand ?? existing.ScaleBrand;
+                    if (!string.IsNullOrWhiteSpace(update.ConnectionType)) existing.ConnectionType = update.ConnectionType;
+                    if (!string.IsNullOrWhiteSpace(update.Protocol)) existing.Protocol = update.Protocol;
                     existing.IpAddress = update.IpAddress ?? existing.IpAddress;
                     if (update.Port > 0) existing.Port = update.Port;
+                    existing.SerialPortName = update.SerialPortName ?? existing.SerialPortName;
+                    if (update.BaudRate > 0) existing.BaudRate = update.BaudRate;
+                    if (update.DataBits > 0) existing.DataBits = update.DataBits;
+                    if (!string.IsNullOrWhiteSpace(update.Parity)) existing.Parity = update.Parity;
+                    if (update.StopBits >= 0) existing.StopBits = update.StopBits;
                     existing.RequestCommand = update.RequestCommand;
                     if (update.PollingIntervalMs > 0) existing.PollingIntervalMs = update.PollingIntervalMs;
                     if (update.TimeoutMs > 0) existing.TimeoutMs = update.TimeoutMs;
@@ -335,7 +345,13 @@ public class ScaleWorker : BackgroundService
         await Task.WhenAll(tasks);
     }
 
-    private async Task PollSingleScale(ScaleConfigEntity scale, CancellationToken ct)
+    private Task PollSingleScale(ScaleConfigEntity scale, CancellationToken ct)
+    {
+        bool isSerial = string.Equals(scale.ConnectionType, "Serial", StringComparison.OrdinalIgnoreCase);
+        return isSerial ? PollSerialScale(scale, ct) : PollTcpScale(scale, ct);
+    }
+
+    private async Task PollTcpScale(ScaleConfigEntity scale, CancellationToken ct)
     {
         var backoff = 2000;
         var maxBackoff = 10000;
@@ -347,37 +363,7 @@ public class ScaleWorker : BackgroundService
                 var (ok, weight, motion, status, rawText, rawHex) = await _smaClient.QueryOnceAsync(
                     scale.IpAddress, scale.Port, scale.RequestCommand, scale.TimeoutMs, ct);
 
-                // Update in-memory store for REST API access
-                _weightStore.Update(scale.ScaleId, new ScaleReading
-                {
-                    ScaleId = scale.ScaleId,
-                    DisplayName = scale.DisplayName,
-                    Weight = weight,
-                    Motion = motion,
-                    Ok = ok,
-                    Status = status,
-                    RawResponse = rawText,
-                    RawHex = rawHex,
-                    LastUpdate = DateTime.Now
-                });
-
-                // Send weight data to web app via SignalR
-                if (_connection?.State == HubConnectionState.Connected)
-                {
-                    await _connection.InvokeAsync("ScaleWeight", new
-                    {
-                        serviceId = _serviceId,
-                        scaleId = scale.ScaleId,
-                        displayName = scale.DisplayName,
-                        weight,
-                        motion,
-                        ok,
-                        status,
-                        rawResponse = rawText,
-                        rawHex,
-                        lastUpdate = DateTime.Now
-                    }, ct);
-                }
+                await PublishReading(scale, weight, motion, ok, status, rawText, rawHex, ct);
 
                 await Task.Delay(scale.PollingIntervalMs, ct);
                 backoff = 2000; // reset after success
@@ -391,42 +377,148 @@ public class ScaleWorker : BackgroundService
                 _log.LogWarning("Scale '{Name}' poll failed: {Msg}. Retrying in {Backoff}ms...",
                     scale.DisplayName, ex.Message, backoff);
 
-                // Update store with error status
-                _weightStore.Update(scale.ScaleId, new ScaleReading
-                {
-                    ScaleId = scale.ScaleId,
-                    DisplayName = scale.DisplayName,
-                    Weight = 0,
-                    Motion = false,
-                    Ok = false,
-                    Status = "Disconnected",
-                    LastUpdate = DateTime.Now
-                });
+                await PublishDisconnected(scale, ct);
 
-                // Send error status via SignalR
-                if (_connection?.State == HubConnectionState.Connected)
+                try { await Task.Delay(backoff, ct); }
+                catch (OperationCanceledException) { break; }
+                backoff = Math.Min(backoff * 2, maxBackoff);
+            }
+        }
+    }
+
+    private async Task PollSerialScale(ScaleConfigEntity scale, CancellationToken ct)
+    {
+        var backoff = 2000;
+        var maxBackoff = 10000;
+        DateTime nextBroadcast = DateTime.MinValue;
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await _serialClient.ReadStreamAsync(scale, async frame =>
                 {
-                    try
+                    // Always update the in-memory store with the latest frame
+                    _weightStore.Update(scale.ScaleId, new ScaleReading
+                    {
+                        ScaleId = scale.ScaleId,
+                        DisplayName = scale.DisplayName,
+                        Weight = frame.Weight,
+                        Motion = frame.Motion,
+                        Ok = frame.Ok,
+                        Status = frame.Status,
+                        RawResponse = frame.RawText,
+                        RawHex = frame.RawHex,
+                        LastUpdate = DateTime.Now
+                    });
+
+                    // Throttle SignalR broadcasts using PollingIntervalMs
+                    var now = DateTime.UtcNow;
+                    if (now < nextBroadcast) return;
+                    nextBroadcast = now.AddMilliseconds(scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 250);
+
+                    if (_connection?.State == HubConnectionState.Connected)
                     {
                         await _connection.InvokeAsync("ScaleWeight", new
                         {
                             serviceId = _serviceId,
                             scaleId = scale.ScaleId,
                             displayName = scale.DisplayName,
-                            weight = 0,
-                            motion = false,
-                            ok = false,
-                            status = "Disconnected",
+                            weight = frame.Weight,
+                            motion = frame.Motion,
+                            ok = frame.Ok,
+                            status = frame.Status,
+                            rawResponse = frame.RawText,
+                            rawHex = frame.RawHex,
                             lastUpdate = DateTime.Now
                         }, ct);
                     }
-                    catch { /* ignore */ }
-                }
+                }, ct);
+
+                backoff = 2000;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Scale '{Name}' serial read failed: {Msg}. Retrying in {Backoff}ms...",
+                    scale.DisplayName, ex.Message, backoff);
+
+                await PublishDisconnected(scale, ct);
 
                 try { await Task.Delay(backoff, ct); }
                 catch (OperationCanceledException) { break; }
                 backoff = Math.Min(backoff * 2, maxBackoff);
             }
+        }
+    }
+
+    private async Task PublishReading(ScaleConfigEntity scale, int weight, bool motion, bool ok,
+        string status, string rawText, string rawHex, CancellationToken ct)
+    {
+        _weightStore.Update(scale.ScaleId, new ScaleReading
+        {
+            ScaleId = scale.ScaleId,
+            DisplayName = scale.DisplayName,
+            Weight = weight,
+            Motion = motion,
+            Ok = ok,
+            Status = status,
+            RawResponse = rawText,
+            RawHex = rawHex,
+            LastUpdate = DateTime.Now
+        });
+
+        if (_connection?.State == HubConnectionState.Connected)
+        {
+            await _connection.InvokeAsync("ScaleWeight", new
+            {
+                serviceId = _serviceId,
+                scaleId = scale.ScaleId,
+                displayName = scale.DisplayName,
+                weight,
+                motion,
+                ok,
+                status,
+                rawResponse = rawText,
+                rawHex,
+                lastUpdate = DateTime.Now
+            }, ct);
+        }
+    }
+
+    private async Task PublishDisconnected(ScaleConfigEntity scale, CancellationToken ct)
+    {
+        _weightStore.Update(scale.ScaleId, new ScaleReading
+        {
+            ScaleId = scale.ScaleId,
+            DisplayName = scale.DisplayName,
+            Weight = 0,
+            Motion = false,
+            Ok = false,
+            Status = "Disconnected",
+            LastUpdate = DateTime.Now
+        });
+
+        if (_connection?.State == HubConnectionState.Connected)
+        {
+            try
+            {
+                await _connection.InvokeAsync("ScaleWeight", new
+                {
+                    serviceId = _serviceId,
+                    scaleId = scale.ScaleId,
+                    displayName = scale.DisplayName,
+                    weight = 0,
+                    motion = false,
+                    ok = false,
+                    status = "Disconnected",
+                    lastUpdate = DateTime.Now
+                }, ct);
+            }
+            catch { /* ignore */ }
         }
     }
 

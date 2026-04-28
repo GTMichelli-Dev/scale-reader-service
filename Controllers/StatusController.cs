@@ -153,8 +153,15 @@ public class StatusController : Controller
 
         existing.DisplayName = update.DisplayName ?? existing.DisplayName;
         existing.ScaleBrand = update.ScaleBrand ?? existing.ScaleBrand;
+        if (!string.IsNullOrWhiteSpace(update.ConnectionType)) existing.ConnectionType = update.ConnectionType;
+        if (!string.IsNullOrWhiteSpace(update.Protocol)) existing.Protocol = update.Protocol;
         existing.IpAddress = update.IpAddress ?? existing.IpAddress;
         existing.Port = update.Port > 0 ? update.Port : existing.Port;
+        existing.SerialPortName = update.SerialPortName ?? existing.SerialPortName;
+        if (update.BaudRate > 0) existing.BaudRate = update.BaudRate;
+        if (update.DataBits > 0) existing.DataBits = update.DataBits;
+        if (!string.IsNullOrWhiteSpace(update.Parity)) existing.Parity = update.Parity;
+        if (update.StopBits >= 0) existing.StopBits = update.StopBits;
         existing.RequestCommand = update.RequestCommand;
         existing.PollingIntervalMs = update.PollingIntervalMs > 0 ? update.PollingIntervalMs : existing.PollingIntervalMs;
         existing.TimeoutMs = update.TimeoutMs > 0 ? update.TimeoutMs : existing.TimeoutMs;
