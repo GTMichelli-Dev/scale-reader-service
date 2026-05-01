@@ -38,8 +38,23 @@
     "notes": "Cardinal Scale digital indicators."
   },
   {
+  "brand": "Cardinal",
+  "model": "225 Navigator (IQ355)",
+  "type": "Serial",
+  "protocol": "SMA",
+  "baudRate": 9600,
+  "dataBits": 8,
+  "parity": "None",
+  "stopBits": 1,
+  "weightRegex": "^\\n?([ZOEe ])([0-9 ])([GTN])([M ])(.)([\\s+-]?\\d{1,6}\\.\\d{3})([a-zA-Z]{2,3})\\r?$",
+  "printCommand": "P",
+  "zeroCommand": "Z",
+  "demandCommand": "gross\\r\\n",
+  "notes": "Cardinal 225 Navigator configured for SMA serial format. SMA frame format: LF + status flag + range + mode + motion + custom flag + weight + units + CR. Mode will be G for Gross, T for Tare, or N for Net. For gross demand output, send W and parse frames where mode is G. Default serial settings are commonly 9600,8,N,1. Set ConnectionType=Serial and Protocol=SMA on the scale config. SerialPortName examples: 'COM1' on Windows or '/dev/ttyUSB0' on Linux."
+},
+  {
     "brand": "Cardinal",
-    "model": "225 Navigator (IQ355)",
+    "model": "225 Navigator (sma)",
     "type": "Serial",
     "protocol": "IQ355",
     "baudRate": 9600,
