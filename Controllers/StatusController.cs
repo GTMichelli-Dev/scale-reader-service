@@ -192,10 +192,23 @@ public class StatusController : Controller
 
     // ===== BRANDS =====
 
+    /// <summary>
+    /// Returns the current brand definitions. Each call attempts to refresh from
+    /// the configured remote URL; on success the local cache is updated. The
+    /// response carries Source ("remote"|"local") + Error so the caller can warn
+    /// when a stale local fallback is being used.
+    /// </summary>
     [HttpGet("api/status/brands")]
-    public IActionResult GetBrands()
+    public async Task<IActionResult> GetBrands()
     {
-        var brands = HttpContext.RequestServices.GetService<List<ScaleBrandDefinition>>();
-        return Ok(brands ?? new List<ScaleBrandDefinition>());
+        var cache = HttpContext.RequestServices.GetRequiredService<Services.BrandsCache>();
+        var result = await cache.RefreshAsync();
+        return Ok(new
+        {
+            brands = result.Brands,
+            source = result.Source,
+            remoteUrl = result.RemoteUrl,
+            error = result.Error
+        });
     }
 }

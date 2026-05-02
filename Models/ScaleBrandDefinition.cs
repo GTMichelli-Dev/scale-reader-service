@@ -69,28 +69,15 @@ public class ScaleBrandDefinition
     public string? Notes { get; set; }
 
     /// <summary>
-    /// Loads brand definitions from a remote URL first, falling back to local file.
+    /// Loads brand definitions: tries the remote URL first, persists the response
+    /// to the local file on success, and falls back to the local file on failure.
+    /// Returns a rich result so callers can tell the user when the local fallback
+    /// was used.
     /// </summary>
-    public static async Task<List<ScaleBrandDefinition>> LoadBrandsAsync(
+    public static async Task<BrandsLoadResult> LoadBrandsAsync(
         string? remoteUrl, string localPath, string? token, ILogger logger)
     {
-        // Try local first (fast)
-        List<ScaleBrandDefinition>? brands = null;
-        if (File.Exists(localPath))
-        {
-            try
-            {
-                var json = await File.ReadAllTextAsync(localPath);
-                brands = JsonSerializer.Deserialize<List<ScaleBrandDefinition>>(json);
-                logger.LogInformation("Loaded {Count} scale brands from local: {Path}", brands?.Count ?? 0, localPath);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning("Failed to load local scale brands: {Msg}", ex.Message);
-            }
-        }
-
-        // Try remote to get latest (if configured)
+        // Try remote first so the local file gets refreshed on every call.
         if (!string.IsNullOrWhiteSpace(remoteUrl))
         {
             try
@@ -104,16 +91,61 @@ public class ScaleBrandDefinition
                 var remote = JsonSerializer.Deserialize<List<ScaleBrandDefinition>>(json);
                 if (remote != null && remote.Count > 0)
                 {
-                    brands = remote;
-                    logger.LogInformation("Loaded {Count} scale brands from remote: {Url}", brands.Count, remoteUrl);
+                    // Persist what we got back so subsequent offline starts use the latest.
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
+                        await File.WriteAllTextAsync(localPath, json);
+                    }
+                    catch (Exception writeEx)
+                    {
+                        logger.LogWarning("Fetched brands but failed to update local cache at {Path}: {Msg}",
+                            localPath, writeEx.Message);
+                    }
+                    logger.LogInformation("Loaded {Count} scale brands from remote: {Url}", remote.Count, remoteUrl);
+                    return new BrandsLoadResult(remote, "remote", remoteUrl, null);
                 }
+                return new BrandsLoadResult(
+                    await ReadLocalAsync(localPath, logger), "local", remoteUrl,
+                    "Remote returned no entries.");
             }
             catch (Exception ex)
             {
-                logger.LogWarning("Could not load remote scale brands from {Url}. Using local. Error: {Msg}", remoteUrl, ex.Message);
+                logger.LogWarning("Could not load remote scale brands from {Url}. Using local. Error: {Msg}",
+                    remoteUrl, ex.Message);
+                return new BrandsLoadResult(
+                    await ReadLocalAsync(localPath, logger), "local", remoteUrl, ex.Message);
             }
         }
 
-        return brands ?? new List<ScaleBrandDefinition>();
+        return new BrandsLoadResult(await ReadLocalAsync(localPath, logger), "local", null, null);
+    }
+
+    private static async Task<List<ScaleBrandDefinition>> ReadLocalAsync(string localPath, ILogger logger)
+    {
+        if (!File.Exists(localPath)) return new List<ScaleBrandDefinition>();
+        try
+        {
+            var json = await File.ReadAllTextAsync(localPath);
+            var brands = JsonSerializer.Deserialize<List<ScaleBrandDefinition>>(json);
+            logger.LogInformation("Loaded {Count} scale brands from local: {Path}", brands?.Count ?? 0, localPath);
+            return brands ?? new List<ScaleBrandDefinition>();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Failed to load local scale brands: {Msg}", ex.Message);
+            return new List<ScaleBrandDefinition>();
+        }
     }
 }
+
+/// <summary>
+/// Result of a brands load — Source is "remote" when the GitHub fetch succeeded
+/// (in which case the local file was refreshed), "local" when the fallback was
+/// used. Error is set when the remote fetch failed so the caller can surface it.
+/// </summary>
+public record BrandsLoadResult(
+    List<ScaleBrandDefinition> Brands,
+    string Source,
+    string? RemoteUrl,
+    string? Error);

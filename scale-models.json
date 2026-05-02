@@ -54,6 +54,22 @@
 },
   {
     "brand": "Cardinal",
+    "model": "225 (On-Demand)",
+    "type": "Serial",
+    "protocol": "OnDemand",
+    "baudRate": 9600,
+    "dataBits": 8,
+    "parity": "None",
+    "stopBits": 1,
+    "demandCommand": "Gross\r",
+    "responseFormat": "<lf><s><r><n><m><f><xxxxxx.xxx><uuu><cr>",
+    "weightRegex": "\\n([ ZOEe])([1-9])([GTN])([M ])(.)\\s*([+-]?\\d+\\.\\d+)\\s*(ton|lb|oz|t|kg|g)\\r",
+    "printCommand": "P",
+    "zeroCommand": "Z",
+    "notes": "Cardinal 225 on-demand serial format. Service sends 'Gross\\r'; scale replies with LF + status + range + mode (G/T/N) + motion + custom + signed weight (xxxxxx.xxx) + units + CR. Status: Z=center of zero, O=over capacity, E=zero error, e=weight not displayed. Default 9600,8,N,1."
+  },
+  {
+    "brand": "Cardinal",
     "model": "225 Navigator (sma)",
     "type": "Serial",
     "protocol": "IQ355",

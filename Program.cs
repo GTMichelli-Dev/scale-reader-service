@@ -25,21 +25,8 @@ var dbPath = Path.Combine(AppContext.BaseDirectory, "scalereaderservice.db");
 builder.Services.AddDbContext<ScaleDbContext>(options =>
     options.UseSqlite($"Data Source={dbPath}"));
 
-// Load scale brand definitions from local first, then remote
-builder.Services.AddSingleton(sp =>
-{
-    var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("ScaleBrands");
-    var localPath = Path.Combine(AppContext.BaseDirectory, "scale-models.json");
-
-    // Load local first (fast), then try remote to update
-    var config = builder.Configuration.GetSection("Scale");
-    var brandsUrl = config["BrandsUrl"] ?? "";
-    var brandsToken = config["BrandsToken"] ?? "";
-
-    var brands = ScaleBrandDefinition.LoadBrandsAsync(brandsUrl, localPath, brandsToken, logger)
-        .GetAwaiter().GetResult();
-    return brands;
-});
+// Brands cache — refreshed on demand by API/SignalR callers, persists remote responses.
+builder.Services.AddSingleton<BrandsCache>();
 
 // HTTP client for calling web API
 builder.Services.AddHttpClient("BasicWeighApi", client =>
@@ -141,6 +128,10 @@ using (var scope = app.Services.CreateScope())
         }
     }
 }
+
+// Warm the brands cache once on startup — failure is non-fatal because
+// API/SignalR callers will retry the fetch on demand.
+_ = Task.Run(() => app.Services.GetRequiredService<BrandsCache>().RefreshAsync());
 
 // Swagger
 app.UseSwagger();

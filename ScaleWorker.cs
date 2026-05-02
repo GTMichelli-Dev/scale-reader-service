@@ -59,12 +59,11 @@ public class ScaleWorker : BackgroundService
                     hubPath = settings?.SignalRHub ?? "/scaleHub";
                     _serviceId = settings?.ServiceId ?? "default";
 
-                    // Load brands from DB URL if available
+                    // Refresh brands cache so the local file mirrors the remote
+                    // by the time the first SignalR client asks.
                     if (!string.IsNullOrWhiteSpace(settings?.BrandsUrl))
                     {
-                        var logger = _sp.GetRequiredService<ILoggerFactory>().CreateLogger("ScaleBrands");
-                        var localPath = Path.Combine(AppContext.BaseDirectory, "scale-models.json");
-                        await ScaleBrandDefinition.LoadBrandsAsync(settings.BrandsUrl, localPath, settings.BrandsToken, logger);
+                        await _sp.GetRequiredService<BrandsCache>().RefreshAsync();
                     }
                 }
 
@@ -133,13 +132,23 @@ public class ScaleWorker : BackgroundService
 
     private void RegisterHandlers()
     {
-        // Web app can request the loaded brand definitions list
+        // Web app can request the loaded brand definitions list. Each call refreshes
+        // from the configured remote URL (and persists it to the local cache); on
+        // failure the response carries Source="local" + Error so the UI can warn.
         _connection!.On("GetScaleBrands", async () =>
         {
             try
             {
-                var brands = _sp.GetService<List<ScaleBrandDefinition>>() ?? new List<ScaleBrandDefinition>();
-                await _connection!.InvokeAsync("ScaleBrandsResponse", brands);
+                var cache = _sp.GetRequiredService<BrandsCache>();
+                var result = await cache.RefreshAsync();
+                await _connection!.InvokeAsync("ScaleBrandsResponse", new
+                {
+                    serviceId = _serviceId,
+                    brands = result.Brands,
+                    source = result.Source,       // "remote" or "local"
+                    remoteUrl = result.RemoteUrl,
+                    error = result.Error
+                });
             }
             catch (Exception ex) { _log.LogWarning("GetScaleBrands failed: {Msg}", ex.Message); }
         });
