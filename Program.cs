@@ -8,6 +8,15 @@ using Microsoft.OpenApi.Models;
 
 var version = typeof(ScaleWorker).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
 
+// Show the version up-front so it's the first thing on the console — before
+// framework startup logs flood in. Logger banner below repeats it for log files.
+try { Console.Title = $"Scale Reader Service v{version}"; } catch { /* not a real console */ }
+Console.WriteLine();
+Console.WriteLine("============================================");
+Console.WriteLine($"  Scale Reader Service v{version}");
+Console.WriteLine("============================================");
+Console.WriteLine();
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Suppress noisy EF Core command/query warnings
