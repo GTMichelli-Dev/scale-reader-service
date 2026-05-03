@@ -383,48 +383,80 @@ public sealed class SerialScaleClient
     }
 
     /// <summary>
-    /// Parses the Cardinal On-Demand reply:
-    ///   <s><r><n><m><f><xxxxxx.xxx><uuu>
-    /// where s = status flag, r = range digit, n = mode (G/T/N), m = motion (M or space),
-    /// f = custom flag, xxxxxx.xxx = signed weight, uuu = units (lb/kg/ton/...).
+    /// Parses an On-Demand reply. Cardinal indicators emit several variants
+    /// depending on configuration:
+    ///   "     120lb G"             — minimal (weight + units + mode, no spaces)
+    ///   "   8980 LB G    "         — IQ355-style (separated)
+    ///   "   8980 LB G MO "         — IQ355 with motion
+    ///   " Z1G   100.0lb"           — documented full SMA-like layout
+    ///   "-    20 LB G BZ "         — below-zero with sign in its own column
+    ///
+    /// Strategy: pull weight, units, mode, motion, and status flags out
+    /// independently so we don't fail on column alignment differences.
     /// </summary>
-    private static readonly Regex OnDemandRegex = new(
-        @"([ ZOEe])([1-9 ])([GTN])([M ])(.)\s*([+-]?\d+\.\d+)\s*(ton|lb|oz|t|kg|g)",
+    private static readonly Regex WeightUnitsRegex = new(
+        @"(?<sign>[-+])?\s*(?<weight>\d+(?:\.\d+)?)\s*(?<units>lb|kg|ton|oz|t|g)\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ModeRegex = new(@"(?<![A-Za-z])([GNT])(?![A-Za-z])", RegexOptions.Compiled);
 
     public static SerialFrame ParseOnDemand(string raw)
     {
         var frame = new SerialFrame { RawText = raw };
-        var m = OnDemandRegex.Match(raw);
-        if (!m.Success)
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            frame.Ok = false;
+            frame.Status = "No data";
+            return frame;
+        }
+
+        var weightMatch = WeightUnitsRegex.Match(raw);
+        if (!weightMatch.Success)
         {
             frame.Ok = false;
             frame.Status = "Parse error";
             return frame;
         }
 
-        char statusFlag = m.Groups[1].Value[0];
-        char mode       = m.Groups[3].Value[0];
-        char motionChar = m.Groups[4].Value[0];
-        double weightDecimal = double.Parse(m.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture);
+        double weightDecimal = double.Parse(weightMatch.Groups["weight"].Value,
+            System.Globalization.CultureInfo.InvariantCulture);
 
-        // Round to whole pounds for the wire format used by the rest of the system.
+        // Sign can be stuck to the digits or sit in its own column with spaces
+        // between '-' and the number. Catch the standalone-minus case here.
+        bool negative = weightMatch.Groups["sign"].Value == "-"
+            || raw.Substring(0, weightMatch.Index).TrimEnd().EndsWith("-");
+        if (negative) weightDecimal = -weightDecimal;
+
         frame.Weight = (int)Math.Round(weightDecimal);
-        frame.Motion = motionChar == 'M' || motionChar == 'm';
 
-        // Map status flag to friendly text. 'e' = weight not currently displayed (treat as error).
-        switch (statusFlag)
-        {
-            case 'O': frame.Ok = false; frame.Status = "Overload"; break;
-            case 'E': frame.Ok = false; frame.Status = "Indicator Error"; break;
-            case 'e': frame.Ok = false; frame.Status = "Weight Not Displayed"; break;
-            case 'Z': frame.Ok = true;  frame.Status = frame.Motion ? "Motion" : ">0<"; break;
-            default:  frame.Ok = true;  frame.Status = frame.Motion ? "Motion" : "Ok"; break;
-        }
+        // Mode: look anywhere, but ignore letters embedded in 'lb'/'KG' tokens.
+        // Look in the part of the string that isn't the units token to be safe.
+        string scanForMode = raw.Substring(0, weightMatch.Index)
+                             + " "
+                             + raw.Substring(weightMatch.Index + weightMatch.Length);
+        var modeMatch = ModeRegex.Match(scanForMode);
+        char mode = modeMatch.Success ? modeMatch.Groups[1].Value[0] : 'G';
+
+        // Status flags (parsed as discrete tokens or letters-in-fixed-positions)
+        var upper = raw.ToUpperInvariant();
+        bool motion     = upper.Contains(" MO ") || upper.EndsWith(" MO") || upper.Contains(" M ");
+        bool overload   = upper.Contains(" OL ") || upper.StartsWith("O") && upper.Length > 1 && char.IsDigit(upper[1]);
+        bool errorFlag  = upper.Contains(" ER ") || upper.Contains(" E1") || upper.Contains(" E2");
+        bool belowZero  = upper.Contains(" BZ ");
+        bool atZero     = upper.Contains(" ZR ") || upper.Contains(">0<");
+        bool notDisplayed = raw.Contains(" e") && raw.Contains(" e ");
+
+        frame.Motion = motion;
+
+        if (overload)        { frame.Ok = false; frame.Status = "Overload"; }
+        else if (errorFlag)  { frame.Ok = false; frame.Status = "Indicator Error"; }
+        else if (notDisplayed){ frame.Ok = false; frame.Status = "Weight Not Displayed"; }
+        else if (belowZero)  { frame.Ok = true;  frame.Status = motion ? "Motion" : "Below Zero"; }
+        else if (atZero)     { frame.Ok = true;  frame.Status = motion ? "Motion" : ">0<"; }
+        else if (motion)     { frame.Ok = true;  frame.Status = "Motion"; }
+        else                 { frame.Ok = true;  frame.Status = "Ok"; }
 
         if (mode != 'G' && frame.Ok)
         {
-            // Non-gross frames are valid but flagged so the caller can decide.
             frame.Status = $"{frame.Status} ({mode})";
         }
         return frame;
