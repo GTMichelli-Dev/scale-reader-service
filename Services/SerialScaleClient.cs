@@ -69,6 +69,10 @@ public sealed class SerialScaleClient
             DateTime lastNoDataWarn = DateTime.MinValue;
             DateTime lastByteAt = DateTime.UtcNow;
             int silentTimeouts = 0;
+            // After this long with no data, throw out the SerialPort so the outer
+            // poller reopens it. Some USB-serial adapters get stuck and need a
+            // fresh handle even though the OS still sees the device.
+            var portResetAfter = TimeSpan.FromSeconds(30);
 
             while (!ct.IsCancellationRequested)
             {
@@ -88,6 +92,14 @@ public sealed class SerialScaleClient
                             "Check baud/parity, that the scale is powered on and streaming, and that you have the right COM port.",
                             scale.ScaleId, scale.SerialPortName, sinceData.TotalSeconds, silentTimeouts);
                         lastNoDataWarn = DateTime.UtcNow;
+                    }
+                    if (sinceData > portResetAfter)
+                    {
+                        // Force the outer poller to close + reopen the port. The
+                        // OperationCanceledException check below leaves cancellation
+                        // alone; this is a deliberate IO failure to trigger recovery.
+                        throw new IOException(
+                            $"No serial data on {scale.SerialPortName} for {sinceData.TotalSeconds:0}s — recycling port.");
                     }
                     continue;
                 }
@@ -111,7 +123,19 @@ public sealed class SerialScaleClient
                     lastFrameLog = DateTime.UtcNow;
                 }
 
-                await onFrame(frame);
+                // Don't let a SignalR/network blip in the consumer kill the read loop.
+                // The poller's job is to keep reading the scale; downstream errors get
+                // logged and the next frame will be tried.
+                try
+                {
+                    await onFrame(frame);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _log.LogWarning("Scale '{ScaleId}' onFrame handler failed: {Msg}. Continuing read loop.",
+                        scale.ScaleId, ex.Message);
+                }
             }
         }
         finally

@@ -497,7 +497,7 @@ public class ScaleWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _log.LogWarning("Scale '{Name}' serial read failed: {Msg}. Retrying in {Backoff}ms...",
+                _log.LogWarning("Scale '{Name}' serial read failed: {Msg}. Closing port; will reopen in {Backoff}ms.",
                     scale.DisplayName, ex.Message, backoff);
 
                 await PublishDisconnected(scale, ct);
@@ -505,6 +505,8 @@ public class ScaleWorker : BackgroundService
                 try { await Task.Delay(backoff, ct); }
                 catch (OperationCanceledException) { break; }
                 backoff = Math.Min(backoff * 2, maxBackoff);
+                _log.LogInformation("Scale '{Name}' attempting reconnect on {Port}...",
+                    scale.DisplayName, scale.SerialPortName);
             }
         }
     }
