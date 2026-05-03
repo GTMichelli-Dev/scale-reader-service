@@ -1,5 +1,6 @@
 using System.IO.Ports;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using ScaleReaderService.Models;
 
@@ -243,6 +244,200 @@ public sealed class SerialScaleClient
         else                 { frame.Ok = true;  frame.Status = "Ok"; }
 
         return frame;
+    }
+
+    /// <summary>
+    /// On-Demand serial loop: opens the port, then in a loop sends the request command
+    /// (e.g. "Gross\r"), reads the response until CR or timeout, parses, and emits
+    /// each frame to onFrame. Like ReadStreamAsync, throws if the port faults so the
+    /// outer poller can recycle it.
+    /// </summary>
+    public async Task PollOnDemandAsync(
+        ScaleConfigEntity scale,
+        string requestCommand,
+        int pollIntervalMs,
+        Func<SerialFrame, Task> onFrame,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(scale.SerialPortName))
+            throw new InvalidOperationException($"Scale '{scale.ScaleId}' has ConnectionType=Serial but SerialPortName is empty.");
+        if (string.IsNullOrWhiteSpace(requestCommand))
+            throw new InvalidOperationException($"Scale '{scale.ScaleId}' is OnDemand but no Request Command is set (e.g. 'Gross\\r').");
+
+        using var port = new SerialPort(
+            scale.SerialPortName,
+            scale.BaudRate > 0 ? scale.BaudRate : 9600,
+            ParseParity(scale.Parity),
+            scale.DataBits > 0 ? scale.DataBits : 8,
+            ParseStopBits(scale.StopBits))
+        {
+            ReadTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000,
+            WriteTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000,
+            Encoding = Encoding.ASCII,
+            Handshake = Handshake.None,
+            DtrEnable = true,
+            RtsEnable = true
+        };
+
+        port.Open();
+        _log.LogInformation(
+            "Serial port {Port} opened ({Baud},{Bits},{Par},{Stop}) for scale '{ScaleId}' (OnDemand, cmd='{Cmd}').",
+            scale.SerialPortName, port.BaudRate, port.DataBits, port.Parity, port.StopBits, scale.ScaleId,
+            requestCommand.Replace("\r", "\\r").Replace("\n", "\\n"));
+
+        var requestBytes = BuildRequestBytes(requestCommand);
+        var pollDelay = pollIntervalMs > 0 ? pollIntervalMs : 500;
+        DateTime lastFrameLog = DateTime.MinValue;
+        DateTime lastByteAt = DateTime.UtcNow;
+        DateTime lastNoDataWarn = DateTime.MinValue;
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    // Drain anything stale before each request so we don't read an old frame.
+                    if (port.BytesToRead > 0)
+                    {
+                        try { port.DiscardInBuffer(); } catch { /* ignore */ }
+                    }
+
+                    await Task.Run(() => port.Write(requestBytes, 0, requestBytes.Length), ct);
+
+                    var response = await Task.Run(() => ReadUntilCr(port, scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000), ct);
+
+                    if (string.IsNullOrEmpty(response))
+                    {
+                        var sinceData = DateTime.UtcNow - lastByteAt;
+                        if (sinceData.TotalSeconds >= 5 && (DateTime.UtcNow - lastNoDataWarn).TotalSeconds >= 5)
+                        {
+                            _log.LogWarning(
+                                "Scale '{ScaleId}' on {Port}: sent '{Cmd}' but got no reply in {Sec:0}s. " +
+                                "Check baud/parity, that the scale answers to this command, and that you have the right COM port.",
+                                scale.ScaleId, scale.SerialPortName,
+                                requestCommand.Replace("\r", "\\r").Replace("\n", "\\n"),
+                                sinceData.TotalSeconds);
+                            lastNoDataWarn = DateTime.UtcNow;
+                        }
+                    }
+                    else
+                    {
+                        lastByteAt = DateTime.UtcNow;
+                        var frame = ParseOnDemand(response);
+                        frame.RawText = response.Replace("\n", "<LF>").Replace("\r", "<CR>");
+                        frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(response));
+
+                        if ((DateTime.UtcNow - lastFrameLog).TotalMilliseconds >= 1000)
+                        {
+                            _log.LogInformation(
+                                "Scale '{ScaleId}' OnDemand frame raw='{Raw}' hex={Hex} -> weight={W} motion={M} ok={Ok} status={S}",
+                                scale.ScaleId, response, frame.RawHex, frame.Weight, frame.Motion, frame.Ok, frame.Status);
+                            lastFrameLog = DateTime.UtcNow;
+                        }
+
+                        try
+                        {
+                            await onFrame(frame);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                        catch (Exception ex)
+                        {
+                            _log.LogWarning("Scale '{ScaleId}' onFrame handler failed: {Msg}. Continuing.", scale.ScaleId, ex.Message);
+                        }
+                    }
+                }
+                catch (TimeoutException) { /* fall through to next poll */ }
+
+                try { await Task.Delay(pollDelay, ct); }
+                catch (OperationCanceledException) { break; }
+            }
+        }
+        finally
+        {
+            try { if (port.IsOpen) port.Close(); }
+            catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>
+    /// Reads bytes from the port until a CR (0x0D) is seen or timeoutMs elapses.
+    /// Strips leading/trailing CR/LF/NUL on the way out.
+    /// </summary>
+    private static string ReadUntilCr(SerialPort port, int timeoutMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        var sb = new StringBuilder();
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                int b = port.ReadByte();
+                if (b < 0) break;
+                sb.Append((char)b);
+                if (b == 0x0D) break;
+            }
+            catch (TimeoutException) { break; }
+        }
+        return sb.ToString().Trim('\r', '\n', '\0');
+    }
+
+    /// <summary>
+    /// Parses the Cardinal On-Demand reply:
+    ///   <s><r><n><m><f><xxxxxx.xxx><uuu>
+    /// where s = status flag, r = range digit, n = mode (G/T/N), m = motion (M or space),
+    /// f = custom flag, xxxxxx.xxx = signed weight, uuu = units (lb/kg/ton/...).
+    /// </summary>
+    private static readonly Regex OnDemandRegex = new(
+        @"([ ZOEe])([1-9 ])([GTN])([M ])(.)\s*([+-]?\d+\.\d+)\s*(ton|lb|oz|t|kg|g)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static SerialFrame ParseOnDemand(string raw)
+    {
+        var frame = new SerialFrame { RawText = raw };
+        var m = OnDemandRegex.Match(raw);
+        if (!m.Success)
+        {
+            frame.Ok = false;
+            frame.Status = "Parse error";
+            return frame;
+        }
+
+        char statusFlag = m.Groups[1].Value[0];
+        char mode       = m.Groups[3].Value[0];
+        char motionChar = m.Groups[4].Value[0];
+        double weightDecimal = double.Parse(m.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture);
+
+        // Round to whole pounds for the wire format used by the rest of the system.
+        frame.Weight = (int)Math.Round(weightDecimal);
+        frame.Motion = motionChar == 'M' || motionChar == 'm';
+
+        // Map status flag to friendly text. 'e' = weight not currently displayed (treat as error).
+        switch (statusFlag)
+        {
+            case 'O': frame.Ok = false; frame.Status = "Overload"; break;
+            case 'E': frame.Ok = false; frame.Status = "Indicator Error"; break;
+            case 'e': frame.Ok = false; frame.Status = "Weight Not Displayed"; break;
+            case 'Z': frame.Ok = true;  frame.Status = frame.Motion ? "Motion" : ">0<"; break;
+            default:  frame.Ok = true;  frame.Status = frame.Motion ? "Motion" : "Ok"; break;
+        }
+
+        if (mode != 'G' && frame.Ok)
+        {
+            // Non-gross frames are valid but flagged so the caller can decide.
+            frame.Status = $"{frame.Status} ({mode})";
+        }
+        return frame;
+    }
+
+    /// <summary>
+    /// Converts a request-command string from the UI (e.g. "Gross\r") into bytes,
+    /// interpreting "\r" as CR and "\n" as LF the same way the TCP path does.
+    /// </summary>
+    private static byte[] BuildRequestBytes(string s)
+    {
+        s = s.Replace("\\r", "\r").Replace("\\n", "\n");
+        return Encoding.ASCII.GetBytes(s);
     }
 
     private static Parity ParseParity(string? value) => value?.ToUpperInvariant() switch

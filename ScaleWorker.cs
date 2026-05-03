@@ -446,11 +446,16 @@ public class ScaleWorker : BackgroundService
         var maxBackoff = 10000;
         DateTime nextBroadcast = DateTime.MinValue;
 
+        // OnDemand protocols send a request command and read one reply at a time;
+        // continuous protocols (IQ355) just open the port and read whatever streams.
+        bool isOnDemand = string.Equals(scale.Protocol, "OnDemand", StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(scale.Protocol, "Demand", StringComparison.OrdinalIgnoreCase);
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await _serialClient.ReadStreamAsync(scale, async frame =>
+                Func<SerialFrame, Task> handler = async frame =>
                 {
                     // Always update the in-memory store with the latest frame
                     _weightStore.Update(scale.ScaleId, new ScaleReading
@@ -487,7 +492,21 @@ public class ScaleWorker : BackgroundService
                             lastUpdate = DateTime.Now
                         }, ct);
                     }
-                }, ct);
+                };
+
+                if (isOnDemand)
+                {
+                    await _serialClient.PollOnDemandAsync(
+                        scale,
+                        scale.RequestCommand ?? "",
+                        scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 500,
+                        handler,
+                        ct);
+                }
+                else
+                {
+                    await _serialClient.ReadStreamAsync(scale, handler, ct);
+                }
 
                 backoff = 2000;
             }
