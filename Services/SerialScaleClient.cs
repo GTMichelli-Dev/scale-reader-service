@@ -281,9 +281,20 @@ public sealed class SerialScaleClient
 
         port.Open();
         _log.LogInformation(
-            "Serial port {Port} opened ({Baud},{Bits},{Par},{Stop}) for scale '{ScaleId}' (OnDemand, cmd='{Cmd}').",
+            "Serial port {Port} opened ({Baud},{Bits},{Par},{Stop}) for scale '{ScaleId}' (OnDemand, brand='{Brand}', cmd='{Cmd}').",
             scale.SerialPortName, port.BaudRate, port.DataBits, port.Parity, port.StopBits, scale.ScaleId,
-            requestCommand.Replace("\r", "\\r").Replace("\n", "\\n"));
+            scale.ScaleBrand, requestCommand.Replace("\r", "\\r").Replace("\n", "\\n"));
+
+        // Warn once if there is no on-demand parser tuned for this brand — the
+        // Cardinal fallback assumes "any 'M' = motion / any '-' = negative",
+        // which other brands may violate.
+        if (!IsKnownOnDemandBrand(scale.ScaleBrand))
+        {
+            _log.LogWarning(
+                "Scale '{ScaleId}' brand '{Brand}' has no dedicated OnDemand parser; falling back to Cardinal-style parsing. " +
+                "If readings look wrong, add a ParseXxxOnDemand for this brand.",
+                scale.ScaleId, scale.ScaleBrand);
+        }
 
         var requestBytes = BuildRequestBytes(requestCommand);
         var pollDelay = pollIntervalMs > 0 ? pollIntervalMs : 500;
@@ -324,7 +335,7 @@ public sealed class SerialScaleClient
                     else
                     {
                         lastByteAt = DateTime.UtcNow;
-                        var frame = ParseOnDemand(response);
+                        var frame = ParseOnDemandForBrand(scale.ScaleBrand, response);
                         frame.RawText = response.Replace("\n", "<LF>").Replace("\r", "<CR>");
                         frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(response));
 
@@ -399,7 +410,30 @@ public sealed class SerialScaleClient
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ModeRegex = new(@"(?<![A-Za-z])([GNT])(?![A-Za-z])", RegexOptions.Compiled);
 
-    public static SerialFrame ParseOnDemand(string raw)
+    private static bool IsKnownOnDemandBrand(string? brand) =>
+        (brand ?? "").Trim().ToLowerInvariant() == "cardinal";
+
+    /// <summary>
+    /// Routes an on-demand reply to the right brand-specific parser. New
+    /// brands with their own on-demand reply format should be added here
+    /// with their own ParseXxxOnDemand method, not by extending the
+    /// Cardinal parser — its "any 'M' = motion / any '-' = negative" rules
+    /// are tuned to the Cardinal 225 reply format and won't be safe for
+    /// indicators that emit different status bytes.
+    /// </summary>
+    public static SerialFrame ParseOnDemandForBrand(string brand, string raw)
+    {
+        var b = (brand ?? "").Trim().ToLowerInvariant();
+        return b switch
+        {
+            "cardinal" => ParseCardinalOnDemand(raw),
+            // Add cases here as more on-demand brands are supported, e.g.:
+            // "mettler toledo" => ParseMettlerOnDemand(raw),
+            _ => ParseCardinalOnDemand(raw),  // fallback; warn at the call site
+        };
+    }
+
+    public static SerialFrame ParseCardinalOnDemand(string raw)
     {
         var frame = new SerialFrame { RawText = raw };
         if (string.IsNullOrWhiteSpace(raw))
