@@ -62,6 +62,14 @@ public sealed class SerialScaleClient
 
         try
         {
+            // Throttle per-frame logging so a 10Hz stream doesn't drown the console,
+            // and warn loudly when no frames arrive at all (silent feed = wrong port,
+            // wrong baud rate, scale powered off, or wrong protocol).
+            DateTime lastFrameLog = DateTime.MinValue;
+            DateTime lastNoDataWarn = DateTime.MinValue;
+            DateTime lastByteAt = DateTime.UtcNow;
+            int silentTimeouts = 0;
+
             while (!ct.IsCancellationRequested)
             {
                 string line;
@@ -71,16 +79,37 @@ public sealed class SerialScaleClient
                 }
                 catch (TimeoutException)
                 {
+                    silentTimeouts++;
+                    var sinceData = DateTime.UtcNow - lastByteAt;
+                    if (sinceData.TotalSeconds >= 5 && (DateTime.UtcNow - lastNoDataWarn).TotalSeconds >= 5)
+                    {
+                        _log.LogWarning(
+                            "Scale '{ScaleId}' on {Port}: no data received in {Sec:0}s ({Timeouts} read timeouts). " +
+                            "Check baud/parity, that the scale is powered on and streaming, and that you have the right COM port.",
+                            scale.ScaleId, scale.SerialPortName, sinceData.TotalSeconds, silentTimeouts);
+                        lastNoDataWarn = DateTime.UtcNow;
+                    }
                     continue;
                 }
+
+                lastByteAt = DateTime.UtcNow;
+                silentTimeouts = 0;
 
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
                 var frame = ParseIq355(line);
                 frame.RawText = line.Replace("\n", "<LF>").Replace("\r", "<CR>");
                 frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
-                _log.LogDebug("Serial frame raw='{Raw}' parsed weight={W} motion={M} ok={Ok} status={S}",
-                    line, frame.Weight, frame.Motion, frame.Ok, frame.Status);
+
+                // Information-level so it's visible in production, but rate-limited to
+                // ~1 per second so a continuous 10Hz stream doesn't spam the log.
+                if ((DateTime.UtcNow - lastFrameLog).TotalMilliseconds >= 1000)
+                {
+                    _log.LogInformation(
+                        "Scale '{ScaleId}' frame raw='{Raw}' hex={Hex} -> weight={W} motion={M} ok={Ok} status={S}",
+                        scale.ScaleId, line, frame.RawHex, frame.Weight, frame.Motion, frame.Ok, frame.Status);
+                    lastFrameLog = DateTime.UtcNow;
+                }
 
                 await onFrame(frame);
             }
