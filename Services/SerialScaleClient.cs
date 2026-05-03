@@ -420,13 +420,18 @@ public sealed class SerialScaleClient
         double weightDecimal = double.Parse(weightMatch.Groups["weight"].Value,
             System.Globalization.CultureInfo.InvariantCulture);
 
-        // Sign can be stuck to the digits or sit in its own column with spaces
-        // between '-' and the number. Catch the standalone-minus case here.
-        bool negative = weightMatch.Groups["sign"].Value == "-"
-            || raw.Substring(0, weightMatch.Index).TrimEnd().EndsWith("-");
-        if (negative) weightDecimal = -weightDecimal;
+        // The Cardinal On-Demand reply uses simple positional flags rather than
+        // dedicated bytes: any '-' anywhere means a below-zero (negative) reading,
+        // any 'M'/'m' anywhere means motion. None of the valid tokens (lb/kg/ton/
+        // oz/t/g, mode chars G/N/T, status chars Z/O/E/e) contain those letters,
+        // so a whole-string scan is safe.
+        bool negative = raw.IndexOf('-') >= 0;
+        if (negative && weightDecimal > 0) weightDecimal = -weightDecimal;
 
         frame.Weight = (int)Math.Round(weightDecimal);
+
+        bool motion = raw.IndexOf('M') >= 0 || raw.IndexOf('m') >= 0;
+        frame.Motion = motion;
 
         // Mode: look anywhere, but ignore letters embedded in 'lb'/'KG' tokens.
         // Look in the part of the string that isn't the units token to be safe.
@@ -436,16 +441,14 @@ public sealed class SerialScaleClient
         var modeMatch = ModeRegex.Match(scanForMode);
         char mode = modeMatch.Success ? modeMatch.Groups[1].Value[0] : 'G';
 
-        // Status flags (parsed as discrete tokens or letters-in-fixed-positions)
+        // Less-common status flags — left as token matches so we don't false-positive
+        // on letters inside other tokens.
         var upper = raw.ToUpperInvariant();
-        bool motion     = upper.Contains(" MO ") || upper.EndsWith(" MO") || upper.Contains(" M ");
-        bool overload   = upper.Contains(" OL ") || upper.StartsWith("O") && upper.Length > 1 && char.IsDigit(upper[1]);
+        bool overload   = upper.Contains(" OL ") || (upper.Length > 1 && upper[0] == 'O' && char.IsDigit(upper[1]));
         bool errorFlag  = upper.Contains(" ER ") || upper.Contains(" E1") || upper.Contains(" E2");
-        bool belowZero  = upper.Contains(" BZ ");
+        bool belowZero  = negative;
         bool atZero     = upper.Contains(" ZR ") || upper.Contains(">0<");
         bool notDisplayed = raw.Contains(" e") && raw.Contains(" e ");
-
-        frame.Motion = motion;
 
         if (overload)        { frame.Ok = false; frame.Status = "Overload"; }
         else if (errorFlag)  { frame.Ok = false; frame.Status = "Indicator Error"; }
