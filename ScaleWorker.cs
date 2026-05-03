@@ -402,10 +402,34 @@ public class ScaleWorker : BackgroundService
             {
                 break;
             }
+            catch (OperationCanceledException)
+            {
+                // Linked-CTS deadline tripped (not worker shutdown) — connect or
+                // read timed out. This is the common "scale unreachable" case.
+                _log.LogWarning("Scale '{Name}' at {Ip}:{Port} did not respond within {Timeout}ms. Retrying in {Backoff}ms.",
+                    scale.DisplayName, scale.IpAddress, scale.Port, scale.TimeoutMs, backoff);
+
+                await PublishDisconnected(scale, ct);
+
+                try { await Task.Delay(backoff, ct); }
+                catch (OperationCanceledException) { break; }
+                backoff = Math.Min(backoff * 2, maxBackoff);
+            }
+            catch (System.Net.Sockets.SocketException sx)
+            {
+                _log.LogWarning("Scale '{Name}' at {Ip}:{Port} unreachable: {Msg}. Retrying in {Backoff}ms.",
+                    scale.DisplayName, scale.IpAddress, scale.Port, sx.Message, backoff);
+
+                await PublishDisconnected(scale, ct);
+
+                try { await Task.Delay(backoff, ct); }
+                catch (OperationCanceledException) { break; }
+                backoff = Math.Min(backoff * 2, maxBackoff);
+            }
             catch (Exception ex)
             {
-                _log.LogWarning("Scale '{Name}' poll failed: {Msg}. Retrying in {Backoff}ms...",
-                    scale.DisplayName, ex.Message, backoff);
+                _log.LogWarning("Scale '{Name}' at {Ip}:{Port} poll failed: {Msg}. Retrying in {Backoff}ms.",
+                    scale.DisplayName, scale.IpAddress, scale.Port, ex.Message, backoff);
 
                 await PublishDisconnected(scale, ct);
 
