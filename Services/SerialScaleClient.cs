@@ -352,15 +352,20 @@ public sealed class SerialScaleClient
 
     /// <summary>
     /// Populate a SerialFrame from a successful brand-defined regex match.
-    /// Contract (positional but lenient — supports any reasonable group layout):
-    ///   Group 1                 : weight (signed decimal; required).
-    ///   Group 2..N (any order)  : a single-char value in {G,N,T} is the mode;
-    ///                             a value of "MO" indicates motion. Other
-    ///                             groups (e.g. unit codes "LB"/"KG"/"L") are
-    ///                             informational and ignored by the parser.
-    /// Mirrors the Cardinal/Rice Lake paths' contract: Weight is rounded to
-    /// int, Motion reflects the MO token, Ok is true only for clean Gross
-    /// readings (Not Gross Mode otherwise).
+    /// Contract (positional with safe fallbacks):
+    ///   Group 1 : weight (signed decimal; required).
+    ///   Group 2 : unit token (informational, ignored — e.g. "LB", "KG", "L").
+    ///   Group 3 : mode char {G,N,T} — gates Gross-only readings.
+    ///   Group 4 : status char {M, I, O, ' '}:
+    ///               M = motion, I = invalid, O = over/under range,
+    ///               anything else / empty = valid.
+    ///   Group 5+: legacy slots; any group whose value is "MO" anywhere
+    ///             flags motion (Cardinal-style two-char status block).
+    /// The status read is position-aware (group 4 only) so a unit "O"
+    /// (ounces) captured at group 2 is never mistaken for an over-range
+    /// flag. Mirrors the Cardinal/Rice Lake paths' frame contract:
+    /// Weight is rounded to int; Motion is set on M or MO; Ok is true
+    /// only for a clean Gross-mode valid reading.
     /// </summary>
     private static void ApplyBrandRegexMatch(
         System.Text.RegularExpressions.Match m, SerialFrame frame)
@@ -383,31 +388,51 @@ public sealed class SerialScaleClient
             return;
         }
 
-        bool motion = false;
-        string mode = string.Empty;
-        for (int i = 2; i < m.Groups.Count; i++)
-        {
-            var g = m.Groups[i].Value;
-            if (string.IsNullOrEmpty(g)) continue;
-            var v = g.Trim().ToUpperInvariant();
-            // Motion tokens: Cardinal "MO" (two-char status block) or
-            // Rice Lake / IQ plus 355 "M" (single-char status field).
-            // "M" can't collide with a mode char — modes are G/N/T only.
-            if (v == "MO" || v == "M") motion = true;
-            else if (v.Length == 1 && (v == "G" || v == "N" || v == "T")) mode = v;
-        }
+        var mode   = ReadModeChar(m, groupIndex: 3);
+        var status = ReadStatusChar(m, groupIndex: 4);
+        var motion = status == "M" || HasMOToken(m);
 
         frame.Weight = (int)Math.Round(w);
         frame.Motion = motion;
 
+        // Gross-mode gate.
         if (!string.IsNullOrEmpty(mode) && mode != "G")
         {
             frame.Ok = false;
             frame.Status = "Not Gross Mode";
             return;
         }
+
+        // Status flags — only fire when group 4 actually carried the code,
+        // so a unit "O" (ounces) elsewhere is never read as over-range.
+        if (status == "I") { frame.Ok = false; frame.Status = "Invalid";          return; }
+        if (status == "O") { frame.Ok = false; frame.Status = "Over/Under Range"; return; }
+
         frame.Ok = true;
         frame.Status = motion ? "Motion" : "Ok";
+    }
+
+    private static string ReadModeChar(System.Text.RegularExpressions.Match m, int groupIndex)
+    {
+        if (m.Groups.Count <= groupIndex) return string.Empty;
+        var v = m.Groups[groupIndex].Value.Trim().ToUpperInvariant();
+        return (v.Length == 1 && (v == "G" || v == "N" || v == "T")) ? v : string.Empty;
+    }
+
+    private static string ReadStatusChar(System.Text.RegularExpressions.Match m, int groupIndex)
+    {
+        if (m.Groups.Count <= groupIndex) return string.Empty;
+        var v = m.Groups[groupIndex].Value.Trim().ToUpperInvariant();
+        return (v.Length == 1 && (v == "M" || v == "I" || v == "O")) ? v : string.Empty;
+    }
+
+    private static bool HasMOToken(System.Text.RegularExpressions.Match m)
+    {
+        for (int i = 2; i < m.Groups.Count; i++)
+        {
+            if (m.Groups[i].Value.Trim().ToUpperInvariant() == "MO") return true;
+        }
+        return false;
     }
 
     /// <summary>
