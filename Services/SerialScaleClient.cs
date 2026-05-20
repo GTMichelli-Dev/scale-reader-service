@@ -390,7 +390,10 @@ public sealed class SerialScaleClient
             var g = m.Groups[i].Value;
             if (string.IsNullOrEmpty(g)) continue;
             var v = g.Trim().ToUpperInvariant();
-            if (v == "MO") motion = true;
+            // Motion tokens: Cardinal "MO" (two-char status block) or
+            // Rice Lake / IQ plus 355 "M" (single-char status field).
+            // "M" can't collide with a mode char — modes are G/N/T only.
+            if (v == "MO" || v == "M") motion = true;
             else if (v.Length == 1 && (v == "G" || v == "N" || v == "T")) mode = v;
         }
 
