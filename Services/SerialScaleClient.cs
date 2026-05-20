@@ -215,7 +215,7 @@ public sealed class SerialScaleClient
             var bm = brandRegex.Match(input);
             if (bm.Success)
             {
-                ApplyBrandRegexMatch(bm, frame);
+                ApplyBrandRegexMatch(bm, input, frame);
                 return frame;
             }
         }
@@ -353,7 +353,7 @@ public sealed class SerialScaleClient
     /// <summary>
     /// Populate a SerialFrame from a successful brand-defined regex match.
     /// Contract (positional with safe fallbacks):
-    ///   Group 1 : weight (signed decimal; required).
+    ///   Group 1 : weight (unsigned or signed decimal; required).
     ///   Group 2 : unit token (informational, ignored — e.g. "LB", "KG", "L").
     ///   Group 3 : mode char {G,N,T} — gates Gross-only readings.
     ///   Group 4 : status char {M, I, O, ' '}:
@@ -361,6 +361,14 @@ public sealed class SerialScaleClient
     ///               anything else / empty = valid.
     ///   Group 5+: legacy slots; any group whose value is "MO" anywhere
     ///             flags motion (Cardinal-style two-char status block).
+    /// Polarity handling: many Rice Lake / Condec frames carry the sign in
+    /// a separate POL byte at the start of the frame, with leading-space
+    /// suppression on the weight field — e.g. "-  11200LGM". The regex's
+    /// [+-]? alternation can't span the whitespace gap, so the digits-only
+    /// portion ends up in group 1 without a sign. To recover the sign, we
+    /// scan the input text BEFORE the weight match for a polarity char.
+    /// This also keeps the "group 1 = weight" contract intact for every
+    /// existing brand regex.
     /// The status read is position-aware (group 4 only) so a unit "O"
     /// (ounces) captured at group 2 is never mistaken for an over-range
     /// flag. Mirrors the Cardinal/Rice Lake paths' frame contract:
@@ -368,7 +376,7 @@ public sealed class SerialScaleClient
     /// only for a clean Gross-mode valid reading.
     /// </summary>
     private static void ApplyBrandRegexMatch(
-        System.Text.RegularExpressions.Match m, SerialFrame frame)
+        System.Text.RegularExpressions.Match m, string input, SerialFrame frame)
     {
         if (m.Groups.Count < 2 || string.IsNullOrEmpty(m.Groups[1].Value))
         {
@@ -386,6 +394,29 @@ public sealed class SerialScaleClient
             frame.Ok = false;
             frame.Status = "Parse error";
             return;
+        }
+
+        // Polarity recovery: look in the input text from the start of the
+        // overall match up to (but not including) where group 1 began. If
+        // a '-' lives in that prefix (i.e. a Rice Lake / Condec POL byte
+        // that the regex couldn't capture because of the whitespace gap),
+        // negate the weight. Already-signed weights captured inline by the
+        // regex (e.g. group 1 = "-12000") are unaffected: in that case
+        // group 1 starts at the '-' itself and the prefix is empty.
+        var polPrefixStart = m.Index;
+        var polPrefixEnd   = m.Groups[1].Index;
+        if (polPrefixEnd > polPrefixStart && polPrefixEnd <= (input?.Length ?? 0))
+        {
+            for (int i = polPrefixStart; i < polPrefixEnd; i++)
+            {
+                if (input![i] == '-') { w = -w; break; }
+                // '^' = overload, ']' = under-range (IQ plus 355 spec).
+                // The regex would only have matched if the weight field
+                // also had digits, so seeing these here is unusual — flag
+                // them and stop, ignoring whatever the digits decoded to.
+                if (input[i] == '^') { frame.Ok = false; frame.Status = "Overload";    return; }
+                if (input[i] == ']') { frame.Ok = false; frame.Status = "Under-Range"; return; }
+            }
         }
 
         var mode   = ReadModeChar(m, groupIndex: 3);
