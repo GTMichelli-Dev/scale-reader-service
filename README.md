@@ -91,6 +91,67 @@ The install script will:
 
 **Prerequisites:** Just internet access and `git`. No .NET needed — the script installs everything. The .NET SDK is installed permanently so future updates skip the download.
 
+### Updating an Existing Install (Linux / Raspberry Pi)
+
+`install.sh` is idempotent — re-running it on a machine that already has the service installed will:
+
+1. Stop the running service (`systemctl stop scale-reader-service`).
+2. Back up `scalereaderservice.db` (your scale configs and runtime settings).
+3. Pull the latest `master` from GitHub.
+4. Rebuild the binary for the local architecture.
+5. Restore the database.
+6. Reload + start the systemd unit.
+
+So updating to the newest release is one block of commands on the Pi:
+
+```bash
+git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
+bash /tmp/srs/deploy/install.sh http://localhost
+rm -rf /tmp/srs
+```
+
+(Pass whatever web URL you originally used. `http://localhost` works when the BasicWeigh web app is on the same Pi listening on port 80; `https://yourdomain` for a cloud-hosted web app.)
+
+**Watch the upgrade live**, optional but recommended:
+
+```bash
+# In one terminal — leave this running while you run install.sh in another
+sudo journalctl -u scale-reader-service -f --no-pager
+```
+
+You should see the new version banner come through:
+
+```
+============================================
+  Scale Reader Service v1.2.6
+  Swagger: http://0.0.0.0:5220/swagger
+============================================
+```
+
+**Confirm the new version is what's actually running:**
+
+```bash
+sudo journalctl -u scale-reader-service -n 100 --no-pager | grep "Scale Reader Service v" | tail -1
+```
+
+That line should match the [`<Version>` in `ScaleReaderService.csproj`](ScaleReaderService.csproj). If it shows an older version, the rebuild step was skipped (rare — usually a stale cache); force a clean and re-run:
+
+```bash
+sudo systemctl stop scale-reader-service
+sudo rm -rf /opt/scale-reader-service/bin /opt/scale-reader-service/obj 2>/dev/null
+bash /tmp/srs/deploy/install.sh http://localhost
+```
+
+**Confirm the service connected to the web hub** (so the Scale Management page can see it):
+
+```bash
+sudo journalctl -u scale-reader-service -n 30 --no-pager | grep -E 'Connect|refused' | tail -5
+```
+
+You want to see `Connected to http://.../scaleHub` with no follow-up `Connection refused`. If you see `Connection refused`, the `ServerUrl` in the service's settings table doesn't match the web app's actual listen port — see the next section for fixing that without re-running `install.sh`.
+
+> **The database is preserved across reinstalls** — scale configs, retained tares, `BrandsUrl`, `ServerUrl`, and `ServiceId` all survive. Only the binary is replaced. To start from a clean DB, stop the service and delete `/opt/scale-reader-service/scalereaderservice.db` before running `install.sh`.
+
 ### Run as console app (Windows or Linux)
 
 ```bash
