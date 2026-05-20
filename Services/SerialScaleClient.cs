@@ -22,10 +22,12 @@ namespace ScaleReaderService.Services;
 public sealed class SerialScaleClient
 {
     private readonly ILogger<SerialScaleClient> _log;
+    private readonly BrandsCache _brands;
 
-    public SerialScaleClient(ILogger<SerialScaleClient> log)
+    public SerialScaleClient(ILogger<SerialScaleClient> log, BrandsCache brands)
     {
         _log = log;
+        _brands = brands;
     }
 
     /// <summary>
@@ -60,6 +62,14 @@ public sealed class SerialScaleClient
         _log.LogInformation(
             "Serial port {Port} opened ({Baud},{Bits},{Par},{Stop}) for scale '{ScaleId}'",
             scale.SerialPortName, port.BaudRate, port.DataBits, port.Parity, port.StopBits, scale.ScaleId);
+
+        // Compile the brand-specific weight regex once per connect cycle.
+        // When set, ParseSerialFrame tries it before any built-in parser so
+        // future scale types can be onboarded by editing scale-models.json
+        // alone — no code change in this service. Falls back to built-in
+        // formats (Rice Lake IQ plus 355, then Cardinal IQ355) when null
+        // or when the brand isn't found / its regex is malformed.
+        var brandRegex = ResolveBrandRegex(scale);
 
         try
         {
@@ -110,7 +120,7 @@ public sealed class SerialScaleClient
 
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
-                var frame = ParseIq355(line);
+                var frame = ParseSerialFrame(line, brandRegex);
                 frame.RawText = line.Replace("\n", "<LF>").Replace("\r", "<CR>");
                 frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
 
@@ -172,31 +182,54 @@ public sealed class SerialScaleClient
             | System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
-    /// Parses an IQ355 frame. First tries the Rice Lake 920i / IQ plus 355
-    /// EDP/PRN stream format (no whitespace between weight and unit). If
-    /// that doesn't match, falls through to the original Cardinal 225
-    /// Navigator IQ355 token format:
-    ///   "   8980 LB G    "   stable
-    ///   "   8860 LB G MO "   in motion
-    ///   "-    20 LB G BZ "   below zero (sign in its own column)
-    /// Status flags appear as 2-char tokens after the mode (G/N/T):
-    ///   MO = motion, BZ = below zero, ZR = at zero,
-    ///   OL = overload, UR = under-range, ER = indicator error.
+    /// Backward-compatible entry point used by older call sites and tests.
+    /// New code should call ParseSerialFrame with the brand-defined regex
+    /// resolved via ResolveBrandRegex / BrandsCache.FindByKey.
     /// </summary>
-    public static SerialFrame ParseIq355(string line)
+    public static SerialFrame ParseIq355(string line) => ParseSerialFrame(line, null);
+
+    /// <summary>
+    /// Parses a serial weight frame in priority order:
+    ///   1. Brand-defined weightRegex (from scale-models.json) — captures
+    ///      Group 1 = weight; any of Groups 2..N may carry a single-char mode
+    ///      (G/N/T) or the literal "MO" motion token.
+    ///   2. Rice Lake 920i / IQ plus 355 EDP/PRN stream format (no whitespace
+    ///      between weight and unit). Also used by Condec UMC.
+    ///   3. Cardinal 225 Navigator IQ355 token format:
+    ///        "   8980 LB G    "   stable
+    ///        "   8860 LB G MO "   in motion
+    ///        "-    20 LB G BZ "   below zero (sign in its own column)
+    ///      Status flags appear as 2-char tokens after the mode (G/N/T):
+    ///        MO = motion, BZ = below zero, ZR = at zero,
+    ///        OL = overload, UR = under-range, ER = indicator error.
+    /// </summary>
+    public static SerialFrame ParseSerialFrame(
+        string line, System.Text.RegularExpressions.Regex? brandRegex)
     {
         var frame = new SerialFrame();
+        var input = line ?? string.Empty;
 
-        // ---- Rice Lake / Condec UMC attempt ----
-        var rl = RiceLakeIqPlus355.Match(line ?? string.Empty);
+        // ---- 1. Brand-defined regex (data-driven, preferred) ----
+        if (brandRegex != null)
+        {
+            var bm = brandRegex.Match(input);
+            if (bm.Success)
+            {
+                ApplyBrandRegexMatch(bm, frame);
+                return frame;
+            }
+        }
+
+        // ---- 2. Rice Lake / Condec UMC built-in ----
+        var rl = RiceLakeIqPlus355.Match(input);
         if (rl.Success)
         {
             ApplyRiceLakeIqPlus355(rl, frame);
             return frame;
         }
 
-        // ---- Cardinal 225 Navigator IQ355 token format (existing logic) ----
-        var upper = (line ?? string.Empty).ToUpperInvariant();
+        // ---- 3. Cardinal 225 Navigator IQ355 token format (existing logic) ----
+        var upper = input.ToUpperInvariant();
         var tokens = upper.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
         if (tokens.Length == 0)
@@ -271,6 +304,107 @@ public sealed class SerialScaleClient
         else                 { frame.Ok = true;  frame.Status = "Ok"; }
 
         return frame;
+    }
+
+    /// <summary>
+    /// Compile the brand-defined weightRegex for this scale, if the brand is
+    /// known and its regex is well-formed. Returns null when the brand isn't
+    /// in BrandsCache (e.g. before the first refresh, or for a deleted entry)
+    /// or its regex fails to compile — both cases route the caller through
+    /// the built-in Rice Lake / Cardinal fallbacks.
+    /// </summary>
+    private System.Text.RegularExpressions.Regex? ResolveBrandRegex(ScaleConfigEntity scale)
+    {
+        var brand = _brands.FindByKey(scale.ScaleBrand);
+        if (brand == null)
+        {
+            _log.LogInformation(
+                "Scale '{ScaleId}' brand '{Brand}' not found in BrandsCache; using built-in serial parsers.",
+                scale.ScaleId, scale.ScaleBrand);
+            return null;
+        }
+        if (string.IsNullOrWhiteSpace(brand.WeightRegex))
+        {
+            _log.LogInformation(
+                "Scale '{ScaleId}' brand '{Brand}' has no weightRegex in scale-models.json; using built-in serial parsers.",
+                scale.ScaleId, scale.ScaleBrand);
+            return null;
+        }
+        try
+        {
+            var rx = new System.Text.RegularExpressions.Regex(
+                brand.WeightRegex,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                | System.Text.RegularExpressions.RegexOptions.Compiled);
+            _log.LogInformation(
+                "Scale '{ScaleId}' using brand weightRegex from '{Brand}': {Rx}",
+                scale.ScaleId, scale.ScaleBrand, brand.WeightRegex);
+            return rx;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                "Scale '{ScaleId}' brand '{Brand}' has an invalid weightRegex ({Rx}): {Msg}. Falling back to built-in parsers.",
+                scale.ScaleId, scale.ScaleBrand, brand.WeightRegex, ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Populate a SerialFrame from a successful brand-defined regex match.
+    /// Contract (positional but lenient — supports any reasonable group layout):
+    ///   Group 1                 : weight (signed decimal; required).
+    ///   Group 2..N (any order)  : a single-char value in {G,N,T} is the mode;
+    ///                             a value of "MO" indicates motion. Other
+    ///                             groups (e.g. unit codes "LB"/"KG"/"L") are
+    ///                             informational and ignored by the parser.
+    /// Mirrors the Cardinal/Rice Lake paths' contract: Weight is rounded to
+    /// int, Motion reflects the MO token, Ok is true only for clean Gross
+    /// readings (Not Gross Mode otherwise).
+    /// </summary>
+    private static void ApplyBrandRegexMatch(
+        System.Text.RegularExpressions.Match m, SerialFrame frame)
+    {
+        if (m.Groups.Count < 2 || string.IsNullOrEmpty(m.Groups[1].Value))
+        {
+            frame.Ok = false;
+            frame.Status = "Brand regex captured no weight";
+            return;
+        }
+
+        var weightStr = m.Groups[1].Value.Trim();
+        if (!decimal.TryParse(weightStr,
+                              System.Globalization.NumberStyles.Number,
+                              System.Globalization.CultureInfo.InvariantCulture,
+                              out var w))
+        {
+            frame.Ok = false;
+            frame.Status = "Parse error";
+            return;
+        }
+
+        bool motion = false;
+        string mode = string.Empty;
+        for (int i = 2; i < m.Groups.Count; i++)
+        {
+            var g = m.Groups[i].Value;
+            if (string.IsNullOrEmpty(g)) continue;
+            var v = g.Trim().ToUpperInvariant();
+            if (v == "MO") motion = true;
+            else if (v.Length == 1 && (v == "G" || v == "N" || v == "T")) mode = v;
+        }
+
+        frame.Weight = (int)Math.Round(w);
+        frame.Motion = motion;
+
+        if (!string.IsNullOrEmpty(mode) && mode != "G")
+        {
+            frame.Ok = false;
+            frame.Status = "Not Gross Mode";
+            return;
+        }
+        frame.Ok = true;
+        frame.Status = motion ? "Motion" : "Ok";
     }
 
     /// <summary>

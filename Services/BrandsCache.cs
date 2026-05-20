@@ -28,6 +28,31 @@ public class BrandsCache
     public BrandsLoadResult Get() =>
         _current ?? new BrandsLoadResult(new List<ScaleBrandDefinition>(), "local", null, null);
 
+    /// <summary>
+    /// Look up a brand definition by the same key the web app builds for the
+    /// Scale dropdown: "<Brand> — <Model>" when a model is set, otherwise just
+    /// "<Brand>". Matching is case-insensitive and ignores extra whitespace so
+    /// trailing spaces in the DB don't lose the lookup. Returns null when the
+    /// brand isn't in the cache (e.g. an older scale referencing a removed
+    /// entry, or a fresh start before the first RefreshAsync).
+    /// </summary>
+    public ScaleBrandDefinition? FindByKey(string? scaleBrandKey)
+    {
+        if (string.IsNullOrWhiteSpace(scaleBrandKey)) return null;
+        var key = scaleBrandKey.Trim();
+        var brands = _current?.Brands;
+        if (brands == null || brands.Count == 0) return null;
+        foreach (var b in brands)
+        {
+            var bKey = string.IsNullOrWhiteSpace(b.Model)
+                ? b.Brand
+                : $"{b.Brand} — {b.Model}";
+            if (string.Equals(bKey, key, StringComparison.OrdinalIgnoreCase))
+                return b;
+        }
+        return null;
+    }
+
     public async Task<BrandsLoadResult> RefreshAsync()
     {
         await _gate.WaitAsync();
