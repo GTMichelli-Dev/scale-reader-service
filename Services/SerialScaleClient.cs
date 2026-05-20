@@ -156,8 +156,26 @@ public sealed class SerialScaleClient
         return raw.Trim('\r', '\n', '\0', '\x02');
     }
 
+    // Rice Lake 920i / IQ plus 355 EDP/PRN continuous stream:
+    //   <POL><WEIGHT><UNIT><MODE><STATUS>     e.g. "   12426LG "
+    // No spaces between the adjacent fields (unlike Cardinal IQ355), so
+    // the Cardinal token-splitter can't parse it. Also used by Condec UMC
+    // and other relabels of the same Rice Lake board.
+    //   POL    : ' ' positive, '-' negative, '^' overload, ']' under-range
+    //   WEIGHT : digits, optionally with decimal, leading-space suppression
+    //   UNIT   : L=lb K=kg T=ton G=g O=oz
+    //   MODE   : G=gross N=net T=tare
+    //   STATUS : ' ' valid, I=invalid, M=motion, O=over/under range
+    private static readonly System.Text.RegularExpressions.Regex RiceLakeIqPlus355 =
+        new(@"^\s*([ \-\^\]])?\s*(\d+(?:\.\d+)?)\s*([LKTGO])([GNT])([ IMO])?\s*$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            | System.Text.RegularExpressions.RegexOptions.Compiled);
+
     /// <summary>
-    /// Parses an IQ355 frame. Format observed on Cardinal 225 Navigator:
+    /// Parses an IQ355 frame. First tries the Rice Lake 920i / IQ plus 355
+    /// EDP/PRN stream format (no whitespace between weight and unit). If
+    /// that doesn't match, falls through to the original Cardinal 225
+    /// Navigator IQ355 token format:
     ///   "   8980 LB G    "   stable
     ///   "   8860 LB G MO "   in motion
     ///   "-    20 LB G BZ "   below zero (sign in its own column)
@@ -169,7 +187,16 @@ public sealed class SerialScaleClient
     {
         var frame = new SerialFrame();
 
-        var upper = line.ToUpperInvariant();
+        // ---- Rice Lake / Condec UMC attempt ----
+        var rl = RiceLakeIqPlus355.Match(line ?? string.Empty);
+        if (rl.Success)
+        {
+            ApplyRiceLakeIqPlus355(rl, frame);
+            return frame;
+        }
+
+        // ---- Cardinal 225 Navigator IQ355 token format (existing logic) ----
+        var upper = (line ?? string.Empty).ToUpperInvariant();
         var tokens = upper.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
         if (tokens.Length == 0)
@@ -244,6 +271,62 @@ public sealed class SerialScaleClient
         else                 { frame.Ok = true;  frame.Status = "Ok"; }
 
         return frame;
+    }
+
+    /// <summary>
+    /// Populate a SerialFrame from a successful RiceLakeIqPlus355 regex match.
+    /// Groups: 1=POL, 2=weight, 3=unit, 4=mode, 5=status. Mirrors the Cardinal
+    /// path's contract: Weight is the integer gross-mode reading, Motion reflects
+    /// the M status flag, Ok is true only when the frame is a clean gross-mode
+    /// reading, and Status carries the user-facing label.
+    /// </summary>
+    private static void ApplyRiceLakeIqPlus355(
+        System.Text.RegularExpressions.Match m, SerialFrame frame)
+    {
+        var pol        = m.Groups[1].Value;
+        var weightStr  = m.Groups[2].Value;
+        var unitChar   = m.Groups[3].Value.ToUpperInvariant();
+        var modeChar   = m.Groups[4].Value.ToUpperInvariant();
+        var statusChar = m.Groups[5].Value.ToUpperInvariant();
+
+        // POL='^' = overload, POL=']' = under-range. The weight field in those
+        // frames is filled with carets or close-brackets and the regex would
+        // never have matched the digits anyway, but the spec also allows POL
+        // alone to signal the condition — handle both cases here.
+        if (pol == "^") { frame.Ok = false; frame.Status = "Overload";    return; }
+        if (pol == "]") { frame.Ok = false; frame.Status = "Under-Range"; return; }
+
+        if (!decimal.TryParse(weightStr, System.Globalization.NumberStyles.Number,
+                              System.Globalization.CultureInfo.InvariantCulture,
+                              out var w))
+        {
+            frame.Ok = false;
+            frame.Status = "Parse error";
+            return;
+        }
+        if (pol == "-") w = -w;
+
+        var motion       = statusChar == "M";
+        var invalid      = statusChar == "I";
+        var overOrUnder  = statusChar == "O";
+
+        frame.Weight = (int)Math.Round(w);
+        frame.Motion = motion;
+
+        // Match the Cardinal path's "Gross only" gating so downstream
+        // consumers see a consistent contract regardless of which serial
+        // protocol the indicator speaks.
+        if (modeChar != "G")
+        {
+            frame.Ok = false;
+            frame.Status = "Not Gross Mode";
+            return;
+        }
+
+        if (invalid)           { frame.Ok = false; frame.Status = "Invalid"; }
+        else if (overOrUnder)  { frame.Ok = false; frame.Status = "Over/Under Range"; }
+        else if (motion)       { frame.Ok = true;  frame.Status = "Motion"; }
+        else                   { frame.Ok = true;  frame.Status = "Ok"; }
     }
 
     /// <summary>
