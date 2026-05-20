@@ -396,18 +396,19 @@ public sealed class SerialScaleClient
             return;
         }
 
-        // Polarity recovery: look in the input text from the start of the
-        // overall match up to (but not including) where group 1 began. If
-        // a '-' lives in that prefix (i.e. a Rice Lake / Condec POL byte
-        // that the regex couldn't capture because of the whitespace gap),
-        // negate the weight. Already-signed weights captured inline by the
-        // regex (e.g. group 1 = "-12000") are unaffected: in that case
+        // Polarity recovery: look in the input text from position 0 (NOT
+        // from m.Index — the regex's leading \s* can only eat whitespace,
+        // so a POL byte like '-' actually sits BEFORE the regex match
+        // starts) up to where group 1 began. If a '-' lives in that
+        // prefix (a Rice Lake / Condec POL byte that the regex couldn't
+        // capture because of the whitespace gap between '-' and the
+        // digits), negate the weight. Already-signed weights captured
+        // inline (group 1 = "-12000") are unaffected: in that case
         // group 1 starts at the '-' itself and the prefix is empty.
-        var polPrefixStart = m.Index;
-        var polPrefixEnd   = m.Groups[1].Index;
-        if (polPrefixEnd > polPrefixStart && polPrefixEnd <= (input?.Length ?? 0))
+        var polPrefixEnd = m.Groups[1].Index;
+        if (polPrefixEnd > 0 && polPrefixEnd <= (input?.Length ?? 0))
         {
-            for (int i = polPrefixStart; i < polPrefixEnd; i++)
+            for (int i = 0; i < polPrefixEnd; i++)
             {
                 if (input![i] == '-') { w = -w; break; }
                 // '^' = overload, ']' = under-range (IQ plus 355 spec).
