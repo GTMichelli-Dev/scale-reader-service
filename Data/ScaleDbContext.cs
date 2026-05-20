@@ -26,7 +26,10 @@ public class ScaleDbContext : DbContext
                 Id = 1,
                 ServerUrl = "http://localhost:5110",
                 SignalRHub = "/scaleHub",
-                BrandsUrl = "",
+                // Seed with the public device-definitions URL so a fresh install
+                // can fetch brand metadata without operator intervention. Anyone
+                // running a fork can PUT /api/settings to change it at runtime.
+                BrandsUrl = "https://raw.githubusercontent.com/GTMichelli-Dev/device-definitions/main/scales/scale-models.json",
                 BrandsToken = ""
             });
         });

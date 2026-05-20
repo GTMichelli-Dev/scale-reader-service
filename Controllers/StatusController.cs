@@ -102,7 +102,13 @@ public class StatusController : Controller
 
         _db.SaveChanges();
 
-        // Trigger service restart to pick up new settings
+        // RestartSignal is a SOFT signal — it cancels the worker's connect
+        // loop so it picks up the new ServerUrl/BrandsUrl on the next pass.
+        // It does NOT exit the host process; systemd doesn't see it as a
+        // stop. Operators sometimes mistake the brief reconnect log gap
+        // for the service dying; the log line below makes intent clear.
+        var logger = HttpContext.RequestServices.GetService<ILoggerFactory>()?.CreateLogger("SettingsApi");
+        logger?.LogInformation("Settings updated via API — signaling worker to refresh connection. Service stays running.");
         var restart = HttpContext.RequestServices.GetService<RestartSignal>();
         restart?.TriggerRestart();
 

@@ -125,15 +125,32 @@ using (var scope = app.Services.CreateScope())
         }
     }
 
-    // Update settings from appsettings if ServerUrl changed
+    // Patch settings from appsettings.json so existing installs (where the
+    // seeded BrandsUrl was an empty string or the default ServerUrl was
+    // never overridden) self-heal on the next startup. Operator-set values
+    // are preserved — we only fill in defaults that look unset.
     var settings = db.Settings.OrderBy(s => s.Id).FirstOrDefault();
     if (settings != null)
     {
-        var configUrl = builder.Configuration["Scale:ServerUrl"];
-        if (!string.IsNullOrWhiteSpace(configUrl) && settings.ServerUrl == "http://localhost:5110")
+        var configServerUrl = builder.Configuration["Scale:ServerUrl"];
+        if (!string.IsNullOrWhiteSpace(configServerUrl) && settings.ServerUrl == "http://localhost:5110")
         {
-            settings.ServerUrl = configUrl;
+            settings.ServerUrl = configServerUrl;
             db.SaveChanges();
+        }
+
+        // BrandsUrl: existing rows from older installs were seeded with "".
+        // If still blank, take the default from appsettings.json. Avoids the
+        // silent "Loaded N scale brands from local" forever loop on a fresh
+        // install where nobody ever PUT the URL.
+        if (string.IsNullOrWhiteSpace(settings.BrandsUrl))
+        {
+            var configBrandsUrl = builder.Configuration["Scale:BrandsUrl"];
+            if (!string.IsNullOrWhiteSpace(configBrandsUrl))
+            {
+                settings.BrandsUrl = configBrandsUrl;
+                db.SaveChanges();
+            }
         }
     }
 }

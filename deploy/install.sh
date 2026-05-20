@@ -10,9 +10,24 @@
 #
 # Examples:
 #   git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
-#   bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net
-#   bash /tmp/srs/deploy/install.sh http://basicscale.scaledata.net --service-id plant-1 --port 5220
+#
+#   # Production: web app reachable as a real hostname / public URL (port 80 or 443)
+#   bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net
+#
+#   # LAN Pi: web app on the same Pi listening on port 80
+#   bash /tmp/srs/deploy/install.sh http://localhost
+#
+#   # Local dev: web app launched via `dotnet run` on port 5110
+#   bash /tmp/srs/deploy/install.sh http://localhost:5110
+#
+#   bash /tmp/srs/deploy/install.sh http://localhost --service-id plant-1 --port 5220
 #   rm -rf /tmp/srs
+#
+# Pick the URL to match the web app's *actual* listen port. The LAN-only Pi
+# deploy binds Kestrel to :80 (see web README), so the right URL is
+# http://localhost — not http://localhost:5110 (which is the dev default).
+# A wrong URL puts the service into an endless "Connection refused" reconnect
+# loop, visible via `journalctl -u scale-reader-service -f`.
 #
 # To update an existing install, run the same command again — it will
 # stop the service, update files, preserve the database, and restart.
@@ -40,8 +55,12 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: install.sh <web-server-url> [options]"
             echo ""
-            echo "  <web-server-url>       Required. URL of the BasicWeigh web server"
-            echo "                         Example: http://basicscale.scaledata.net"
+            echo "  <web-server-url>       Required. URL of the BasicWeigh web server."
+            echo "                         Must match the web app's actual listen port."
+            echo "                         Examples:"
+            echo "                           https://basicscale.scaledata.net   (production)"
+            echo "                           http://localhost                   (LAN Pi, web on :80)"
+            echo "                           http://localhost:5110              (dev, dotnet run)"
             echo ""
             echo "Options:"
             echo "  --service-id <id>      Unique ID for this service (default: default)"
@@ -72,7 +91,11 @@ if [ -z "$WEB_URL" ]; then
     echo ""
     echo "Usage:"
     echo "  git clone https://github.com/${GITHUB_REPO}.git /tmp/srs"
-    echo "  bash /tmp/srs/deploy/install.sh http://your-server:5110"
+    echo "  bash /tmp/srs/deploy/install.sh <web-server-url>"
+    echo ""
+    echo "Examples:"
+    echo "  bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net   # production"
+    echo "  bash /tmp/srs/deploy/install.sh http://localhost                   # LAN Pi, web on :80"
     echo ""
     echo "Run with --help for all options."
     exit 1
@@ -273,12 +296,15 @@ if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
     echo "  Configure scales via Swagger:"
     echo "    http://$(hostname -I | awk '{print $1}'):${SERVICE_PORT}/swagger"
     echo ""
-    echo "  Update service ID:"
+    echo "  Update service ID or web URL later:"
     echo "    curl -X PUT http://localhost:${SERVICE_PORT}/api/settings \\"
     echo "      -H 'Content-Type: application/json' \\"
     echo "      -d '{\"serviceId\": \"${SERVICE_ID}\", \"serverUrl\": \"${WEB_URL}\"}'"
     echo ""
-    echo "  To update later, run this command again."
+    echo "  To update the binary, re-run this install.sh — the DB is preserved."
+    echo ""
+    echo "  Verify the service connected to the web hub (no Connection refused):"
+    echo "    sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager | grep -E 'Connect|refused'"
     echo "============================================"
 else
     echo "============================================"

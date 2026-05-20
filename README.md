@@ -36,12 +36,31 @@ Scale protocol definitions can be loaded from the [device-definitions](https://g
 
 ### Quick Install (Linux / Raspberry Pi)
 
-SSH into the target machine and run:
+SSH into the target machine and run one of:
 
 ```bash
 git clone https://github.com/GTMichelli-Dev/scale-reader-service.git /tmp/srs
-bash /tmp/srs/deploy/install.sh https://your-basicweigh-server
+
+# Production: web app reachable as a public URL (port 80 or 443)
+bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net
+
+# LAN-only Pi: web app listening on port 80 on the same Pi
+bash /tmp/srs/deploy/install.sh http://localhost
+
+# Local dev: web app launched with `dotnet run` (port 5110)
+bash /tmp/srs/deploy/install.sh http://localhost:5110
+
 rm -rf /tmp/srs
+```
+
+The web-server URL must match the **actual listen port** of the web app. The
+LAN-only Pi deploy binds Kestrel directly to port 80 — so the right URL is
+`http://localhost`, not `http://localhost:5110` (that one is the dev default
+and only applies when the web app is launched via `dotnet run`). A wrong URL
+puts the service into an endless "Connection refused" reconnect loop:
+
+```bash
+sudo journalctl -u scale-reader-service -n 20 --no-pager | grep -E 'Connect|refused'
 ```
 
 With options:
