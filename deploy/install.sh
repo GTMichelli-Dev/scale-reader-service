@@ -40,7 +40,7 @@ SERVICE_ID="default"
 SERVICE_PORT="5220"
 INSTALL_DIR="/opt/scale-reader-service"
 SERVICE_NAME="scale-reader-service"
-DOTNET_CHANNEL="8.0"
+DOTNET_CHANNEL="10.0"
 GITHUB_REPO="GTMichelli-Dev/scale-reader-service"
 BRANCH="master"
 WEB_URL=""
@@ -219,8 +219,12 @@ sudo apt-get install -y -qq git 2>/dev/null || true
 git clone --depth 1 --branch "${BRANCH}" "https://github.com/${GITHUB_REPO}.git" "${CLONE_DIR}"
 
 # Check if SDK is available
+# Match the MAJOR version of DOTNET_CHANNEL (e.g. "10" from "10.0") —
+# `dotnet --list-sdks` prints lines like "10.0.301 [/path]". A hard-coded
+# literal here silently skips the SDK install after a channel bump.
+DOTNET_MAJOR="${DOTNET_CHANNEL%%.*}"
 HAS_SDK=false
-if dotnet --list-sdks 2>/dev/null | grep -q "8\."; then
+if dotnet --list-sdks 2>/dev/null | grep -q "^${DOTNET_MAJOR}\."; then
     HAS_SDK=true
 fi
 
