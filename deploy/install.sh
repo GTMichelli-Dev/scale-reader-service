@@ -125,6 +125,40 @@ esac
 echo "  OS: $(uname -s) $(uname -r)"
 echo "  Architecture: ${ARCH} (${RID})"
 
+# ---- Serial port access ----
+# RS-232 scales (e.g. Condec UMC via a USB-serial adapter) show up as
+# /dev/ttyUSB0 / /dev/ttyAMA0, owned by group 'dialout'. The systemd unit
+# below runs as this user, so without dialout membership every serial open
+# fails with "Access to the port ... is denied".
+if ! id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx 'dialout'; then
+    sudo usermod -aG dialout "$USER"
+    echo "  Added $USER to dialout group (serial port access)."
+    echo "  NOTE: takes effect for the systemd service on next start (handled below);"
+    echo "        interactive shells need a logout/login."
+else
+    echo "  $USER already in dialout group (serial port access)."
+fi
+
+# ---- Firewall ----
+# Pi OS ships with no firewall, but a site-hardened image may have ufw or
+# iptables rules that would block the Swagger/config API.
+if command -v ufw &> /dev/null && sudo ufw status | grep -q "active"; then
+    sudo ufw allow 22/tcp > /dev/null
+    sudo ufw allow "${SERVICE_PORT}"/tcp > /dev/null
+    echo "  Firewall: ufw — ports 22 and ${SERVICE_PORT} opened."
+fi
+if command -v iptables &> /dev/null; then
+    sudo iptables -C INPUT -p tcp --dport "${SERVICE_PORT}" -j ACCEPT 2>/dev/null || \
+        sudo iptables -I INPUT -p tcp --dport "${SERVICE_PORT}" -j ACCEPT
+    if command -v netfilter-persistent &> /dev/null; then
+        sudo netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save &> /dev/null; then
+        sudo mkdir -p /etc/iptables
+        sudo sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null || true
+    fi
+    echo "  Firewall: iptables — port ${SERVICE_PORT} opened and persisted."
+fi
+
 # ---- Install .NET 8 ----
 echo "[2/5] Installing .NET runtime..."
 DOTNET_ROOT="$HOME/.dotnet"
@@ -261,6 +295,9 @@ WorkingDirectory=${INSTALL_DIR}
 Restart=always
 RestartSec=5
 User=${USER}
+# Explicit so serial (/dev/ttyUSB*) access never depends on when the user
+# was added to dialout relative to this unit being (re)started.
+SupplementaryGroups=dialout
 Environment=DOTNET_ROOT=${DOTNET_ROOT}
 Environment=ASPNETCORE_URLS=http://0.0.0.0:${SERVICE_PORT}
 Environment=DOTNET_ENVIRONMENT=Production

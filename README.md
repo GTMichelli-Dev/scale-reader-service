@@ -1,6 +1,6 @@
 # Scale Reader Service
 
-A .NET 8.0 cross-platform service that reads weight data from industrial scales via IP (SMA 8.1.2 protocol, Mettler Toledo Shared Data, or custom) and posts readings to web applications via SignalR.
+A .NET 8.0 cross-platform service that reads weight data from industrial scales via IP (SMA 8.1.2 protocol, Mettler Toledo Shared Data, or custom) **or RS-232 serial** (continuous-stream or on-demand indicators) and posts readings to web applications via SignalR.
 
 ## How It Works
 
@@ -29,8 +29,33 @@ A .NET 8.0 cross-platform service that reads weight data from industrial scales 
 | SMA 8.1.2 (Generic) | Standard SMA weight request/response over TCP. Supports Weigh-Tronix ZM-301 and compatible indicators. |
 | Mettler Toledo Shared Data | Mettler Toledo Shared Data Services protocol via IP. |
 | Custom | Any TCP-based scale protocol with configurable request/response parsing. |
+| Serial continuous stream | RS-232 indicators that stream weight frames constantly. Built-in parsers for the Rice Lake IQ plus 355 / 920i EDP-PRN format (also used by **Condec UMC**) and the Cardinal 225 Navigator token format; other streams can be onboarded with a `weightRegex` in the brand definition — no code change. |
+| Serial on-demand | RS-232 indicators that answer a request command (e.g. Cardinal `Gross\r`). |
 
 Scale protocol definitions can be loaded from the [device-definitions](https://github.com/GTMichelli-Dev/device-definitions) repo.
+
+## Serial (RS-232) scales — e.g. Condec UMC
+
+Typical hookup for a Condec UMC indicator streaming continuously at 9600,8,N,1:
+
+1. **Hardware:** indicator's RS-232 port → USB-to-serial adapter → Pi. The
+   adapter shows up as `/dev/ttyUSB0` (check with `ls /dev/ttyUSB*`).
+2. **Indicator:** set `STREAM=EDP` (or `PRN`) in the SERIAL menu so it emits
+   the continuous IQ plus 355-style frames (`  12000LG `, `-  11200LGM`).
+3. **Configure the scale** via Swagger (`http://<pi>:5220/swagger`) or the
+   web app's scale setup: `connectionType: "Serial"`,
+   `serialPortName: "/dev/ttyUSB0"`, `baudRate: 9600`, `dataBits: 8`,
+   `parity: "None"`, `stopBits: 1`, `scaleBrand: "Condec — UMC / Continuous"`,
+   `protocol: "Continuous"`.
+4. **Permissions:** the service user must be in the `dialout` group —
+   `deploy/install.sh` handles this (plus `SupplementaryGroups=dialout` in
+   the systemd unit). If you installed manually: `sudo usermod -aG dialout $USER`
+   and restart the service.
+
+**Troubleshooting:** raw frames are logged (rate-limited) —
+`sudo journalctl -u scale-reader-service -f` shows `frame raw='...' hex=...`
+for every parsed reading, plus loud warnings when the port is silent (wrong
+port/baud) or frames don't parse (wrong protocol/brand).
 
 ## Installation
 
