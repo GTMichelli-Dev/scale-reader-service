@@ -306,26 +306,35 @@ public static class ScaleFormatDetector
     {
         if (frames.Count < 2) return;
 
-        for (int col = 0; col < length; col++)
+        // Two passes, strongest evidence first. A motion flag paired with a blank is
+        // unambiguous. Some indicators instead spell the stable state with a letter
+        // (a Rice Lake 920i seen in the field alternates 'B' and 'M'), so a second
+        // pass accepts a non-blank partner — but never G/N/T, since a column flipping
+        // between those is the gross/net/tare mode changing, not motion.
+        for (int pass = 0; pass < 2; pass++)
         {
-            // Skip the weight itself.
-            if (result.WeightStart is int ws && result.WeightEnd is int we && col >= ws && col <= we)
-                continue;
-
-            var chars = frames.Select(f => char.ToUpperInvariant(f[col])).ToList();
-            if (chars.Distinct().Count() != 2) continue;
-
-            foreach (var candidate in MotionCandidates)
+            for (int col = 0; col < length; col++)
             {
-                if (!chars.Contains(candidate)) continue;
-                // The other value should be a blank/stable marker, not a second letter —
-                // that pattern is a mode field (G/N/T), not a motion flag.
-                var other = chars.First(c => c != candidate);
-                if (!char.IsWhiteSpace(other) && other != '\0') continue;
+                // Skip the weight itself.
+                if (result.WeightStart is int ws && result.WeightEnd is int we && col >= ws && col <= we)
+                    continue;
 
-                result.MotionIndex = col;
-                result.MotionChar = candidate.ToString();
-                return;
+                var chars = frames.Select(f => char.ToUpperInvariant(f[col])).ToList();
+                if (chars.Distinct().Count() != 2) continue;
+
+                foreach (var candidate in MotionCandidates)
+                {
+                    if (!chars.Contains(candidate)) continue;
+                    var other = chars.First(c => c != candidate);
+                    bool blankPartner = char.IsWhiteSpace(other) || other == '\0';
+
+                    if (pass == 0 && !blankPartner) continue;
+                    if (pass == 1 && (other == 'G' || other == 'N' || other == 'T')) continue;
+
+                    result.MotionIndex = col;
+                    result.MotionChar = candidate.ToString();
+                    return;
+                }
             }
         }
     }
