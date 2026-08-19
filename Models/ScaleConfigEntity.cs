@@ -73,4 +73,34 @@ public class ScaleConfigEntity
 
     /// <summary>Whether this scale is active</summary>
     public bool Active { get; set; } = true;
+
+    // ---- Stream tokens (continuous output) ----
+    // Filled in by Auto-Detect on the scale setup screen, or by hand when no brand
+    // definition matches what the indicator actually streams. Only consulted when
+    // FrameParseMode is "Positions", so existing scales keep their brand-regex
+    // behaviour untouched.
+
+    /// <summary>"Brand" (use the brand weightRegex / built-in parsers) or "Positions".</summary>
+    [StringLength(20)]
+    public string FrameParseMode { get; set; } = "Brand";
+
+    /// <summary>0-based first column of the weight field in the frame.</summary>
+    public int? FrameWeightStart { get; set; }
+
+    /// <summary>0-based last column of the weight field, inclusive.</summary>
+    public int? FrameWeightEnd { get; set; }
+
+    /// <summary>0-based column carrying the motion flag, or null when the frame has none.</summary>
+    public int? FrameMotionIndex { get; set; }
+
+    /// <summary>Character in FrameMotionIndex that means "in motion" (typically "M").</summary>
+    [StringLength(1)]
+    public string? FrameMotionChar { get; set; }
+
+    /// <summary>0-based column holding the sign, for indicators that put it in its own field.</summary>
+    public int? FrameSignIndex { get; set; }
+
+    /// <summary>Character in FrameSignIndex that means negative (typically "-").</summary>
+    [StringLength(1)]
+    public string? FrameSignNegChar { get; set; }
 }

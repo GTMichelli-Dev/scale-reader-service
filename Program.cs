@@ -102,6 +102,13 @@ using (var scope = app.Services.CreateScope())
     AddColumnIfMissing(db, "Scales", "DataBits", "INTEGER NOT NULL DEFAULT 8");
     AddColumnIfMissing(db, "Scales", "Parity", "TEXT NOT NULL DEFAULT 'None'");
     AddColumnIfMissing(db, "Scales", "StopBits", "INTEGER NOT NULL DEFAULT 1");
+    AddColumnIfMissing(db, "Scales", "FrameParseMode", "TEXT NOT NULL DEFAULT 'Brand'");
+    AddColumnIfMissing(db, "Scales", "FrameWeightStart", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "FrameWeightEnd", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "FrameMotionIndex", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "FrameMotionChar", "TEXT NULL");
+    AddColumnIfMissing(db, "Scales", "FrameSignIndex", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "FrameSignNegChar", "TEXT NULL");
 
     // Seed from appsettings.json if no scales exist yet
     if (!db.Scales.Any())

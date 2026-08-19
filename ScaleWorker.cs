@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using ScaleReaderService.Data;
@@ -15,6 +16,7 @@ public class ScaleWorker : BackgroundService
     private readonly SmaClient _smaClient;
     private readonly SerialScaleClient _serialClient;
     private readonly ScaleWeightStore _weightStore;
+    private readonly BrandsCache _brands;
     private HubConnection? _connection;
     private string _serviceId = "default";
 
@@ -25,7 +27,8 @@ public class ScaleWorker : BackgroundService
         AnnounceSignal announce,
         SmaClient smaClient,
         SerialScaleClient serialClient,
-        ScaleWeightStore weightStore)
+        ScaleWeightStore weightStore,
+        BrandsCache brands)
     {
         _sp = sp;
         _log = log;
@@ -34,6 +37,7 @@ public class ScaleWorker : BackgroundService
         _smaClient = smaClient;
         _serialClient = serialClient;
         _weightStore = weightStore;
+        _brands = brands;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -172,11 +176,52 @@ public class ScaleWorker : BackgroundService
                         s.SerialPortName, s.BaudRate, s.DataBits, s.Parity, s.StopBits,
                         s.RequestCommand,
                         s.PollingIntervalMs, s.TimeoutMs,
+                        s.FrameParseMode,
+                        s.FrameWeightStart, s.FrameWeightEnd,
+                        s.FrameMotionIndex, s.FrameMotionChar,
+                        s.FrameSignIndex, s.FrameSignNegChar,
                         s.Active
                     })
                 });
             }
             catch (Exception ex) { _log.LogWarning("GetScaleList failed: {Msg}", ex.Message); }
+        });
+
+        // Serial ports available on this machine, for the setup screen's port picker.
+        _connection!.On("GetSerialPorts", async () =>
+        {
+            try
+            {
+                await _connection!.InvokeAsync("ScaleSerialPortsResponse", new
+                {
+                    serviceId = _serviceId,
+                    ports = SerialScaleClient.ListPorts()
+                });
+            }
+            catch (Exception ex) { _log.LogWarning("GetSerialPorts failed: {Msg}", ex.Message); }
+        });
+
+        // Auto-Detect: open a temporary connection using the settings the operator has
+        // typed into the Add/Edit Scale modal, capture a few seconds of the stream, and
+        // report what the frames look like. Deliberately works from posted parameters
+        // rather than the database — detection has to run before the scale is saved.
+        _connection!.On<string, System.Text.Json.JsonElement>("DetectFormat", (requestId, config) =>
+        {
+            // Fire-and-forget on a worker thread: a wedged port must not block the
+            // SignalR message pump, and the handler answers on every path so the
+            // browser's button never hangs waiting for a reply that isn't coming.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunDetection(requestId, config);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning("DetectFormat failed: {Msg}", ex.Message);
+                    await SafeDetectReply(requestId, new { ok = false, error = ex.Message });
+                }
+            });
         });
 
         // Reload config command
@@ -275,6 +320,18 @@ public class ScaleWorker : BackgroundService
                     existing.RequestCommand = update.RequestCommand;
                     if (update.PollingIntervalMs > 0) existing.PollingIntervalMs = update.PollingIntervalMs;
                     if (update.TimeoutMs > 0) existing.TimeoutMs = update.TimeoutMs;
+
+                    // Stream tokens are assigned straight across, nulls included: clearing
+                    // the columns is how an operator reverts a scale to brand-regex parsing,
+                    // so a "only copy if set" guard here would make that impossible.
+                    if (!string.IsNullOrWhiteSpace(update.FrameParseMode)) existing.FrameParseMode = update.FrameParseMode;
+                    existing.FrameWeightStart = update.FrameWeightStart;
+                    existing.FrameWeightEnd = update.FrameWeightEnd;
+                    existing.FrameMotionIndex = update.FrameMotionIndex;
+                    existing.FrameMotionChar = update.FrameMotionChar;
+                    existing.FrameSignIndex = update.FrameSignIndex;
+                    existing.FrameSignNegChar = update.FrameSignNegChar;
+
                     existing.Active = update.Active;
                 }
                 await db.SaveChangesAsync();
@@ -339,6 +396,10 @@ public class ScaleWorker : BackgroundService
                     s.SerialPortName, s.BaudRate, s.DataBits, s.Parity, s.StopBits,
                     s.RequestCommand,
                     s.PollingIntervalMs, s.TimeoutMs,
+                    s.FrameParseMode,
+                    s.FrameWeightStart, s.FrameWeightEnd,
+                    s.FrameMotionIndex, s.FrameMotionChar,
+                    s.FrameSignIndex, s.FrameSignNegChar,
                     s.Active
                 })
             });
@@ -349,6 +410,219 @@ public class ScaleWorker : BackgroundService
         {
             _log.LogWarning("Failed to announce scales: {Msg}", ex.Message);
         }
+    }
+
+    // ===== AUTO-DETECT =====
+
+    /// <summary>How long a detect run listens before reporting what it heard.</summary>
+    private const int DetectCaptureMs = 4000;
+    private const int DetectMaxFrames = 40;
+
+    /// <summary>
+    /// Captures frames using the posted connection settings and reports the inferred
+    /// layout. Answers on every path — success, no data, or failure — because the
+    /// browser is sitting on a watchdog waiting for exactly one reply.
+    /// </summary>
+    private async Task RunDetection(string requestId, System.Text.Json.JsonElement config)
+    {
+        var probe = System.Text.Json.JsonSerializer.Deserialize<ScaleConfigEntity>(
+            config.GetRawText(),
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+        if (probe == null)
+        {
+            await SafeDetectReply(requestId, new { ok = false, error = "Could not read the connection settings." });
+            return;
+        }
+
+        // Detection reads a stream; never let a stale RequestCommand turn this into
+        // a demand poll, and give the capture a sane per-read timeout.
+        probe.ScaleId = string.IsNullOrWhiteSpace(probe.ScaleId) ? "detect-probe" : probe.ScaleId;
+        if (probe.TimeoutMs <= 0) probe.TimeoutMs = 1000;
+
+        bool isSerial = string.Equals(probe.ConnectionType, "Serial", StringComparison.OrdinalIgnoreCase);
+
+        // A running poller owns the port/socket. Say so plainly rather than surfacing
+        // a raw UnauthorizedAccessException the operator can't act on.
+        if (isSerial && !string.IsNullOrWhiteSpace(probe.SerialPortName))
+        {
+            using var scope = _sp.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
+            // Any active scale on this port holds it open — including the very scale
+            // being edited, which is the common case (you open Edit on the scale that
+            // isn't reading and press Detect). An earlier version exempted the same
+            // scale id, which just traded this clear message for a raw
+            // "access denied" from port.Open().
+            var holder = await db.Scales.FirstOrDefaultAsync(s =>
+                s.Active && s.ConnectionType == "Serial" && s.SerialPortName == probe.SerialPortName);
+            if (holder != null)
+            {
+                var who = holder.ScaleId == probe.ScaleId
+                    ? "this scale is active, so its reader already holds the port"
+                    : $"the active scale '{holder.ScaleId}' is using it";
+                await SafeDetectReply(requestId, new
+                {
+                    ok = false,
+                    error = $"Serial port {probe.SerialPortName} is busy — {who}. "
+                          + "Set Active to No and Save, then run Auto-Detect."
+                });
+                return;
+            }
+        }
+
+        CaptureResult capture;
+        try
+        {
+            using var cts = new CancellationTokenSource(DetectCaptureMs + 5000);
+            capture = isSerial
+                ? await _serialClient.CaptureFramesAsync(probe, DetectCaptureMs, DetectMaxFrames, cts.Token)
+                : await CaptureTcpFramesAsync(probe, DetectCaptureMs, DetectMaxFrames, cts.Token);
+        }
+        catch (Exception ex)
+        {
+            await SafeDetectReply(requestId, new { ok = false, error = DescribeProbeFailure(ex, probe, isSerial) });
+            return;
+        }
+
+        // "Found nothing" has several very different causes and each has a different
+        // fix, so distinguish them rather than reporting one vague failure.
+        if (capture.Frames.Count == 0)
+        {
+            string where = isSerial ? probe.SerialPortName ?? "the port" : $"{probe.IpAddress}:{probe.Port}";
+            string error;
+            if (capture.BytesRead == 0)
+            {
+                error = $"Connected to {where} but no data arrived in {DetectCaptureMs / 1000} seconds. "
+                      + (isSerial
+                          ? "Check the baud rate, data bits and parity, that the cable is on the right port, "
+                          + "and that the indicator is set to stream continuously. If it only replies when polled, "
+                          + "put its command in Request Command and detect again."
+                          : "Check that the indicator streams without being asked; if it only replies when polled, "
+                          + "put its command in Request Command and detect again.");
+            }
+            else
+            {
+                error = $"Received {capture.BytesRead} bytes from {where}, but none were CR/LF terminated, "
+                      + "so no complete frame could be read. This usually means the baud rate, data bits or "
+                      + $"parity is wrong. First bytes: {capture.RawSample}";
+            }
+            await SafeDetectReply(requestId, new { ok = false, error });
+            return;
+        }
+
+        var brands = _brands.Get().Brands;
+        var detection = ScaleFormatDetector.Detect(capture.Frames, brands);
+
+        await SafeDetectReply(requestId, new
+        {
+            ok = true,
+            serviceId = _serviceId,
+            connectionType = isSerial ? "Serial" : "TCP",
+            bytesRead = capture.BytesRead,
+            detection
+        });
+    }
+
+    /// <summary>Turns a probe exception into something an operator can act on.</summary>
+    private static string DescribeProbeFailure(Exception ex, ScaleConfigEntity probe, bool isSerial) => ex switch
+    {
+        UnauthorizedAccessException =>
+            $"Serial port {probe.SerialPortName} is in use or access was denied.",
+        FileNotFoundException =>
+            $"Serial port {probe.SerialPortName} does not exist on this machine.",
+        System.Net.Sockets.SocketException =>
+            $"Could not connect to {probe.IpAddress}:{probe.Port} — {ex.Message}",
+        OperationCanceledException =>
+            isSerial
+                ? $"No data arrived on {probe.SerialPortName} within the capture window."
+                : $"No data arrived from {probe.IpAddress}:{probe.Port} within the capture window.",
+        _ => ex.Message
+    };
+
+    /// <summary>
+    /// Reply helper that never throws. If the hub connection dropped mid-detect there
+    /// is nobody to tell, and an exception here would escape onto a background task.
+    /// </summary>
+    private async Task SafeDetectReply(string requestId, object payload)
+    {
+        try
+        {
+            if (_connection?.State != HubConnectionState.Connected) return;
+            await _connection.InvokeAsync("ScaleFormatDetectResult", new
+            {
+                requestId,
+                serviceId = _serviceId,
+                result = payload
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("Could not deliver detect result for {RequestId}: {Msg}", requestId, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Reads CR-delimited frames from a streaming TCP indicator. Used both by
+    /// Auto-Detect and by the continuous TCP poll path.
+    /// </summary>
+    private static async Task<CaptureResult> CaptureTcpFramesAsync(
+        ScaleConfigEntity scale, int captureMs, int maxFrames, CancellationToken ct)
+    {
+        var result = new CaptureResult();
+        var frames = result.Frames;
+        var rawBytes = new List<byte>();
+        using var client = new System.Net.Sockets.TcpClient();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(captureMs + 2000);
+
+        await client.ConnectAsync(scale.IpAddress, scale.Port, cts.Token);
+        using var ns = client.GetStream();
+
+        // Some indicators stream only after a nudge; send the request command once
+        // if one is configured, then just listen.
+        if (!string.IsNullOrWhiteSpace(scale.RequestCommand))
+        {
+            var cmd = System.Text.Encoding.ASCII.GetBytes(
+                scale.RequestCommand.Replace("\\r", "\r").Replace("\\n", "\n"));
+            await ns.WriteAsync(cmd, cts.Token);
+            await ns.FlushAsync(cts.Token);
+        }
+
+        var deadline = DateTime.UtcNow.AddMilliseconds(captureMs);
+        var buffer = new byte[512];
+        var pending = new StringBuilder();
+
+        while (DateTime.UtcNow < deadline && frames.Count < maxFrames && !cts.Token.IsCancellationRequested)
+        {
+            if (!ns.DataAvailable)
+            {
+                await Task.Delay(20, cts.Token);
+                continue;
+            }
+
+            int read = await ns.ReadAsync(buffer, cts.Token);
+            if (read <= 0) break;
+            for (int i = 0; i < read; i++) rawBytes.Add(buffer[i]);
+            pending.Append(System.Text.Encoding.ASCII.GetString(buffer, 0, read));
+
+            // Split on CR or LF; indicators vary, and blank segments are dropped.
+            var text = pending.ToString();
+            int cut;
+            while ((cut = text.IndexOfAny(new[] { '\r', '\n' })) >= 0)
+            {
+                var line = text.Substring(0, cut).Trim('\0', '\x02', '\x03');
+                if (!string.IsNullOrWhiteSpace(line)) frames.Add(line);
+                text = text.Substring(cut + 1);
+                if (frames.Count >= maxFrames) break;
+            }
+            pending.Clear();
+            pending.Append(text);
+        }
+
+        result.BytesRead = rawBytes.Count;
+        result.RawSample = BitConverter.ToString(rawBytes.Take(64).ToArray());
+        if (frames.Count == 0 && pending.Length > 0) result.Unterminated = pending.ToString();
+        return result;
     }
 
     private async Task PollScales(CancellationToken ct)
@@ -386,12 +660,46 @@ public class ScaleWorker : BackgroundService
         var backoff = 2000;
         var maxBackoff = 10000;
 
+        // Streaming indicators (typically a continuous-output scale behind a
+        // serial-to-Ethernet converter) push frames unprompted. Demand-polling one
+        // with QueryOnceAsync reconnects on every reading and reads whichever frame
+        // happens to be mid-flight, so those get a held-open read loop instead.
+        bool isStreaming = string.Equals(scale.Protocol, "Continuous", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(scale.Protocol, "Stream", StringComparison.OrdinalIgnoreCase);
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
+                if (isStreaming)
+                {
+                    await StreamTcpScale(scale, ct);
+                    backoff = 2000;
+
+                    // StreamTcpScale returns when the feed stops or the peer closes.
+                    // Pause before reconnecting: an indicator that accepts and then
+                    // immediately drops would otherwise be hammered in a tight loop.
+                    await Task.Delay(1000, ct);
+                    continue;
+                }
+
                 var (ok, weight, motion, status, rawText, rawHex) = await _smaClient.QueryOnceAsync(
                     scale.IpAddress, scale.Port, scale.RequestCommand, scale.TimeoutMs, ct);
+
+                // Columns the operator configured for this indicator override the SMA
+                // parse. Without this an Auto-Detect result would be silently ignored
+                // whenever the brand's protocol happens to be demand rather than
+                // continuous — the tokens would save, and change nothing.
+                var demandPositions = ScaleFormatDetector.PositionTokens.From(scale);
+                if (demandPositions.HasValue)
+                {
+                    var reparsed = ScaleFormatDetector.ParseByPositions(
+                        rawText.Replace("<CR>", "").Replace("<LF>", "").TrimEnd(), demandPositions.Value);
+                    weight = reparsed.Weight;
+                    motion = reparsed.Motion;
+                    ok = reparsed.Ok;
+                    status = reparsed.Status;
+                }
 
                 await PublishReading(scale, weight, motion, ok, status, rawText, rawHex, ct);
 
@@ -437,6 +745,117 @@ public class ScaleWorker : BackgroundService
                 catch (OperationCanceledException) { break; }
                 backoff = Math.Min(backoff * 2, maxBackoff);
             }
+        }
+    }
+
+    /// <summary>
+    /// Holds a TCP connection open and publishes every CR-delimited frame the
+    /// indicator streams. Returns when the socket closes or the token trips, so the
+    /// caller's existing catch/backoff blocks handle reconnection. Frames are parsed
+    /// by exactly the same code the serial streaming path uses, so a given indicator
+    /// behaves identically whether it's wired to a COM port or an Ethernet converter.
+    /// </summary>
+    private async Task StreamTcpScale(ScaleConfigEntity scale, CancellationToken ct)
+    {
+        var brandRegex = _serialClient.GetBrandRegex(scale);
+        var positions = ScaleFormatDetector.PositionTokens.From(scale);
+
+        using var client = new System.Net.Sockets.TcpClient();
+        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        connectCts.CancelAfter(scale.TimeoutMs > 0 ? scale.TimeoutMs : 2000);
+        await client.ConnectAsync(scale.IpAddress, scale.Port, connectCts.Token);
+
+        using var ns = client.GetStream();
+        _log.LogInformation("Streaming scale '{ScaleId}' from {Ip}:{Port}{Mode}",
+            scale.ScaleId, scale.IpAddress, scale.Port,
+            positions.HasValue ? " (column positions)" : "");
+
+        // Some indicators need a nudge before they start streaming.
+        if (!string.IsNullOrWhiteSpace(scale.RequestCommand))
+        {
+            var cmd = Encoding.ASCII.GetBytes(scale.RequestCommand.Replace("\\r", "\r").Replace("\\n", "\n"));
+            await ns.WriteAsync(cmd, ct);
+            await ns.FlushAsync(ct);
+        }
+
+        var buffer = new byte[512];
+        var pending = new StringBuilder();
+        DateTime nextBroadcast = DateTime.MinValue;
+        DateTime lastData = DateTime.UtcNow;
+        int silenceTimeoutMs = Math.Max(scale.TimeoutMs > 0 ? scale.TimeoutMs * 5 : 5000, 5000);
+
+        while (!ct.IsCancellationRequested)
+        {
+            if (!ns.DataAvailable)
+            {
+                // A stream that has gone quiet is a disconnected scale. Drop out so
+                // the caller reports it and reconnects rather than blocking forever.
+                if ((DateTime.UtcNow - lastData).TotalMilliseconds > silenceTimeoutMs)
+                {
+                    _log.LogWarning("Scale '{ScaleId}' stopped streaming for {Ms}ms. Reconnecting.",
+                        scale.ScaleId, silenceTimeoutMs);
+                    await PublishDisconnected(scale, ct);
+                    return;
+                }
+                await Task.Delay(20, ct);
+                continue;
+            }
+
+            int read = await ns.ReadAsync(buffer, ct);
+            if (read <= 0) return; // peer closed
+            lastData = DateTime.UtcNow;
+            pending.Append(Encoding.ASCII.GetString(buffer, 0, read));
+
+            var text = pending.ToString();
+            int cut;
+            while ((cut = text.IndexOfAny(new[] { '\r', '\n' })) >= 0)
+            {
+                var line = text.Substring(0, cut).Trim('\0', '\x02', '\x03');
+                text = text.Substring(cut + 1);
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                var frame = SerialScaleClient.ParseSerialFrame(line, brandRegex, positions);
+                frame.RawText = line;
+                frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
+
+                _weightStore.Update(scale.ScaleId, new ScaleReading
+                {
+                    ScaleId = scale.ScaleId,
+                    DisplayName = scale.DisplayName,
+                    Weight = frame.Weight,
+                    Motion = frame.Motion,
+                    Ok = frame.Ok,
+                    Status = frame.Status,
+                    RawResponse = frame.RawText,
+                    RawHex = frame.RawHex,
+                    LastUpdate = DateTime.Now
+                });
+
+                // Same throttle the serial streaming path applies — a 10Hz indicator
+                // must not turn into 10 SignalR broadcasts a second.
+                var now = DateTime.UtcNow;
+                if (now < nextBroadcast) continue;
+                nextBroadcast = now.AddMilliseconds(scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 250);
+
+                if (_connection?.State == HubConnectionState.Connected)
+                {
+                    await _connection.InvokeAsync("ScaleWeight", new
+                    {
+                        serviceId = _serviceId,
+                        scaleId = scale.ScaleId,
+                        displayName = scale.DisplayName,
+                        weight = frame.Weight,
+                        motion = frame.Motion,
+                        ok = frame.Ok,
+                        status = frame.Status,
+                        rawResponse = frame.RawText,
+                        rawHex = frame.RawHex,
+                        lastUpdate = DateTime.Now
+                    }, ct);
+                }
+            }
+            pending.Clear();
+            pending.Append(text);
         }
     }
 

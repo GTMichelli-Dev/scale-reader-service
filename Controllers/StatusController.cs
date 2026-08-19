@@ -196,6 +196,65 @@ public class StatusController : Controller
         return Ok(new { deleted = scaleId });
     }
 
+    // ===== COMMISSIONING =====
+
+    /// <summary>Serial ports this machine offers, for the setup screen's port picker.</summary>
+    [HttpGet("api/serialports")]
+    public IActionResult SerialPorts() => Ok(SerialScaleClient.ListPorts());
+
+    /// <summary>
+    /// Run format detection against frames you already captured, without touching
+    /// hardware. This is the tool for working out an undocumented indicator: paste
+    /// what it streams, see which columns hold the weight and the motion flag.
+    /// Accepts either a list of text frames or a list of hex frames ("02-31-32-03").
+    /// </summary>
+    [HttpPost("api/detect")]
+    public async Task<IActionResult> Detect([FromBody] DetectRequest body)
+    {
+        var frames = new List<string>();
+
+        if (body?.Frames is { Count: > 0 })
+            frames.AddRange(body.Frames);
+
+        if (body?.HexFrames is { Count: > 0 })
+        {
+            foreach (var hex in body.HexFrames)
+            {
+                try
+                {
+                    var bytes = hex.Split(new[] { '-', ' ', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(h => Convert.ToByte(h, 16)).ToArray();
+                    frames.Add(System.Text.Encoding.ASCII.GetString(bytes));
+                }
+                catch (Exception ex)
+                {
+                    return BadRequest(new { message = $"Could not read '{hex}' as hex: {ex.Message}" });
+                }
+            }
+        }
+
+        if (frames.Count == 0)
+            return BadRequest(new { message = "Supply at least one frame in 'frames' or 'hexFrames'." });
+
+        // Brand matching is best-effort: if the definitions can't be reached the
+        // position detection is still perfectly useful on its own.
+        List<ScaleBrandDefinition>? brands = null;
+        try
+        {
+            var cache = HttpContext.RequestServices.GetRequiredService<BrandsCache>();
+            brands = (await cache.RefreshAsync()).Brands;
+        }
+        catch { /* fall through with brands = null */ }
+
+        return Ok(ScaleFormatDetector.Detect(frames, brands));
+    }
+
+    public class DetectRequest
+    {
+        public List<string>? Frames { get; set; }
+        public List<string>? HexFrames { get; set; }
+    }
+
     // ===== BRANDS =====
 
     /// <summary>

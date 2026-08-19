@@ -39,24 +39,7 @@ public sealed class SerialScaleClient
         Func<SerialFrame, Task> onFrame,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(scale.SerialPortName))
-            throw new InvalidOperationException($"Scale '{scale.ScaleId}' has ConnectionType=Serial but SerialPortName is empty.");
-
-        using var port = new SerialPort(
-            scale.SerialPortName,
-            scale.BaudRate > 0 ? scale.BaudRate : 9600,
-            ParseParity(scale.Parity),
-            scale.DataBits > 0 ? scale.DataBits : 8,
-            ParseStopBits(scale.StopBits))
-        {
-            ReadTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 2000,
-            WriteTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 2000,
-            NewLine = "\r",
-            Encoding = Encoding.ASCII,
-            Handshake = Handshake.None,
-            DtrEnable = true,
-            RtsEnable = true
-        };
+        using var port = BuildPort(scale, defaultTimeoutMs: 2000, setNewLine: true);
 
         port.Open();
         _log.LogInformation(
@@ -70,6 +53,15 @@ public sealed class SerialScaleClient
         // formats (Rice Lake IQ plus 355, then Cardinal IQ355) when null
         // or when the brand isn't found / its regex is malformed.
         var brandRegex = ResolveBrandRegex(scale);
+
+        // Operator-configured column positions, when this scale has them. Resolved once
+        // per connect cycle alongside the regex; null leaves the brand/built-in path intact.
+        var positions = ScaleFormatDetector.PositionTokens.From(scale);
+        if (positions.HasValue)
+            _log.LogInformation(
+                "Scale '{ScaleId}' parsing by column positions: weight {Start}..{End}, motion '{Char}' @ {Motion}",
+                scale.ScaleId, positions.Value.WeightStart, positions.Value.WeightEnd,
+                positions.Value.MotionChar, positions.Value.MotionIndex);
 
         try
         {
@@ -120,7 +112,7 @@ public sealed class SerialScaleClient
 
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
-                var frame = ParseSerialFrame(line, brandRegex);
+                var frame = ParseSerialFrame(line, brandRegex, positions);
                 frame.RawText = line.Replace("\n", "<LF>").Replace("\r", "<CR>");
                 frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
 
@@ -205,9 +197,25 @@ public sealed class SerialScaleClient
     /// </summary>
     public static SerialFrame ParseSerialFrame(
         string line, System.Text.RegularExpressions.Regex? brandRegex)
+        => ParseSerialFrame(line, brandRegex, null);
+
+    /// <summary>
+    /// As above, but honouring per-scale column positions when the operator has set
+    /// them (Auto-Detect, or by hand on the scale setup screen). Positions win over
+    /// every brand/built-in parser: they were configured against frames this exact
+    /// indicator actually sent, so they are better evidence than a shared regex.
+    /// </summary>
+    public static SerialFrame ParseSerialFrame(
+        string line,
+        System.Text.RegularExpressions.Regex? brandRegex,
+        ScaleFormatDetector.PositionTokens? positions)
     {
         var frame = new SerialFrame();
         var input = line ?? string.Empty;
+
+        // ---- 0. Operator-configured column positions ----
+        if (positions.HasValue && positions.Value.IsUsable)
+            return ScaleFormatDetector.ParseByPositions(input, positions.Value);
 
         // ---- 1. Brand-defined regex (data-driven, preferred) ----
         if (brandRegex != null)
@@ -313,6 +321,13 @@ public sealed class SerialScaleClient
     /// or its regex fails to compile — both cases route the caller through
     /// the built-in Rice Lake / Cardinal fallbacks.
     /// </summary>
+    /// <summary>
+    /// The compiled brand regex for a scale, for callers outside this class that
+    /// parse frames themselves — notably the TCP streaming path, which reads its own
+    /// socket but must parse frames identically to the serial one.
+    /// </summary>
+    public System.Text.RegularExpressions.Regex? GetBrandRegex(ScaleConfigEntity scale) => ResolveBrandRegex(scale);
+
     private System.Text.RegularExpressions.Regex? ResolveBrandRegex(ScaleConfigEntity scale)
     {
         var brand = _brands.FindByKey(scale.ScaleBrand);
@@ -536,25 +551,10 @@ public sealed class SerialScaleClient
         Func<SerialFrame, Task> onFrame,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(scale.SerialPortName))
-            throw new InvalidOperationException($"Scale '{scale.ScaleId}' has ConnectionType=Serial but SerialPortName is empty.");
         if (string.IsNullOrWhiteSpace(requestCommand))
             throw new InvalidOperationException($"Scale '{scale.ScaleId}' is OnDemand but no Request Command is set (e.g. 'Gross\\r').");
 
-        using var port = new SerialPort(
-            scale.SerialPortName,
-            scale.BaudRate > 0 ? scale.BaudRate : 9600,
-            ParseParity(scale.Parity),
-            scale.DataBits > 0 ? scale.DataBits : 8,
-            ParseStopBits(scale.StopBits))
-        {
-            ReadTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000,
-            WriteTimeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000,
-            Encoding = Encoding.ASCII,
-            Handshake = Handshake.None,
-            DtrEnable = true,
-            RtsEnable = true
-        };
+        using var port = BuildPort(scale, defaultTimeoutMs: 1000, setNewLine: false);
 
         port.Open();
         _log.LogInformation(
@@ -612,7 +612,14 @@ public sealed class SerialScaleClient
                     else
                     {
                         lastByteAt = DateTime.UtcNow;
-                        var frame = ParseOnDemandForBrand(scale.ScaleBrand, response);
+
+                        // Operator-configured columns beat the brand parser here too.
+                        // A scale whose columns were set from its own frames must parse
+                        // the same way regardless of which protocol fetched them.
+                        var onDemandPositions = ScaleFormatDetector.PositionTokens.From(scale);
+                        var frame = onDemandPositions.HasValue
+                            ? ScaleFormatDetector.ParseByPositions(response.TrimEnd('\r', '\n'), onDemandPositions.Value)
+                            : ParseOnDemandForBrand(scale.ScaleBrand, response);
                         frame.RawText = response.Replace("\n", "<LF>").Replace("\r", "<CR>");
                         frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(response));
 
@@ -786,6 +793,139 @@ public sealed class SerialScaleClient
         return Encoding.ASCII.GetBytes(s);
     }
 
+    /// <summary>
+    /// Builds the SerialPort for a scale. Shared by the streaming, on-demand and
+    /// capture paths so all three agree on framing, handshake and line settings —
+    /// they drifted apart when this was duplicated inline.
+    /// </summary>
+    private static SerialPort BuildPort(ScaleConfigEntity scale, int defaultTimeoutMs, bool setNewLine)
+    {
+        if (string.IsNullOrWhiteSpace(scale.SerialPortName))
+            throw new InvalidOperationException(
+                $"Scale '{scale.ScaleId}' has ConnectionType=Serial but SerialPortName is empty.");
+
+        int timeout = scale.TimeoutMs > 0 ? scale.TimeoutMs : defaultTimeoutMs;
+
+        var port = new SerialPort(
+            scale.SerialPortName,
+            scale.BaudRate > 0 ? scale.BaudRate : 9600,
+            ParseParity(scale.Parity),
+            scale.DataBits > 0 ? scale.DataBits : 8,
+            ParseStopBits(scale.StopBits))
+        {
+            ReadTimeout = timeout,
+            WriteTimeout = timeout,
+            Encoding = Encoding.ASCII,
+            Handshake = Handshake.None,
+            DtrEnable = true,
+            RtsEnable = true
+        };
+
+        // Only the streaming path reads by line; the on-demand path reads to CR by hand.
+        if (setNewLine) port.NewLine = "\r";
+        return port;
+    }
+
+    /// <summary>
+    /// Serial ports this machine offers. The Linux branch matters on the Pi
+    /// deployments, where GetPortNames alone misses USB adapters.
+    /// </summary>
+    public static List<string> ListPorts()
+    {
+        var ports = new HashSet<string>(SerialPort.GetPortNames());
+        if (!OperatingSystem.IsWindows())
+        {
+            foreach (var pattern in new[] { "ttyUSB*", "ttyACM*", "ttyAMA*", "ttyS*" })
+            {
+                try
+                {
+                    foreach (var path in Directory.GetFiles("/dev", pattern)) ports.Add(path);
+                }
+                catch (DirectoryNotFoundException) { /* no /dev — nothing to add */ }
+            }
+        }
+        return ports.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    /// Opens the port and collects raw frames for Auto-Detect, without parsing them
+    /// or touching the database. Returns whatever arrived when the window closes —
+    /// an empty list is a legitimate answer (wrong baud, wrong port, or the
+    /// indicator isn't in continuous mode), and the caller reports it as such.
+    /// </summary>
+    public async Task<CaptureResult> CaptureFramesAsync(
+        ScaleConfigEntity scale, int captureMs, int maxFrames, CancellationToken ct)
+    {
+        var result = new CaptureResult();
+        using var port = BuildPort(scale, defaultTimeoutMs: 1000, setNewLine: true);
+        port.Open();
+        port.DiscardInBuffer();
+
+        _log.LogInformation("Capturing frames on {Port} ({Baud},{Bits},{Par},{Stop}) for up to {Ms}ms",
+            scale.SerialPortName, port.BaudRate, port.DataBits, port.Parity, port.StopBits, captureMs);
+
+        // A demand-mode indicator says nothing until asked. Send the request command
+        // (if one is configured) and keep re-sending it through the window, otherwise
+        // detection would report "no data" for a perfectly healthy scale.
+        byte[]? request = string.IsNullOrWhiteSpace(scale.RequestCommand)
+            ? null
+            : BuildRequestBytes(scale.RequestCommand);
+        DateTime nextRequest = DateTime.MinValue;
+
+        var deadline = DateTime.UtcNow.AddMilliseconds(captureMs);
+        var buffer = new byte[512];
+        var pending = new StringBuilder();
+        var rawBytes = new List<byte>();
+
+        while (DateTime.UtcNow < deadline && result.Frames.Count < maxFrames && !ct.IsCancellationRequested)
+        {
+            if (request != null && DateTime.UtcNow >= nextRequest)
+            {
+                try { port.Write(request, 0, request.Length); } catch (TimeoutException) { }
+                nextRequest = DateTime.UtcNow.AddMilliseconds(
+                    scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 500);
+            }
+
+            if (port.BytesToRead == 0)
+            {
+                await Task.Delay(20, ct);
+                continue;
+            }
+
+            // Read raw bytes rather than ReadLine(). ReadLine only splits on the
+            // configured NewLine ("\r"), and detection exists precisely because we do
+            // NOT yet know how this indicator frames its output — an LF-terminated
+            // scale would time out forever and look like a dead port.
+            int read = port.Read(buffer, 0, Math.Min(buffer.Length, port.BytesToRead));
+            if (read <= 0) continue;
+
+            for (int i = 0; i < read; i++) rawBytes.Add(buffer[i]);
+            pending.Append(Encoding.ASCII.GetString(buffer, 0, read));
+
+            var text = pending.ToString();
+            int cut;
+            while ((cut = text.IndexOfAny(new[] { '\r', '\n' })) >= 0)
+            {
+                var line = text.Substring(0, cut).Trim('\0', '\x02', '\x03');
+                text = text.Substring(cut + 1);
+                if (!string.IsNullOrWhiteSpace(line)) result.Frames.Add(line);
+                if (result.Frames.Count >= maxFrames) break;
+            }
+            pending.Clear();
+            pending.Append(text);
+        }
+
+        result.BytesRead = rawBytes.Count;
+        result.RawSample = BitConverter.ToString(rawBytes.Take(64).ToArray());
+
+        // Bytes arrived but nothing was CR/LF terminated — hand back what we saw so
+        // the operator can tell "wrong baud" from "different terminator".
+        if (result.Frames.Count == 0 && pending.Length > 0)
+            result.Unterminated = pending.ToString();
+
+        return result;
+    }
+
     private static Parity ParseParity(string? value) => value?.ToUpperInvariant() switch
     {
         "EVEN" => System.IO.Ports.Parity.Even,
@@ -801,6 +941,25 @@ public sealed class SerialScaleClient
         0 => System.IO.Ports.StopBits.OnePointFive,
         _ => System.IO.Ports.StopBits.One,
     };
+}
+
+/// <summary>
+/// What a detection capture actually saw. Carries more than the frames so
+/// "nothing arrived" can be told apart from "bytes arrived but never framed" —
+/// on an unknown indicator those two have completely different fixes.
+/// </summary>
+public sealed class CaptureResult
+{
+    public List<string> Frames { get; set; } = new();
+
+    /// <summary>Total bytes received during the window, framed or not.</summary>
+    public int BytesRead { get; set; }
+
+    /// <summary>Hex of the first bytes seen, for diagnosing baud/parity mismatches.</summary>
+    public string RawSample { get; set; } = "";
+
+    /// <summary>Leftover text when bytes arrived but no CR/LF ever did.</summary>
+    public string? Unterminated { get; set; }
 }
 
 public sealed class SerialFrame
