@@ -229,42 +229,69 @@ cd ScaleReaderService
 dotnet run
 ```
 
-### Install as Windows Service
+### Quick Install / Update (Windows)
+
+`deploy/install-windows.ps1` is the Windows counterpart to `install.sh`. A
+production PC usually has neither git nor the .NET SDK, so build a
+self-contained package on a machine that has the source and carry it over.
+
+**On the build machine** — publish into an `app` folder next to the scripts:
 
 ```bash
-dotnet publish -c Release -r win-x64 --self-contained true -o C:\Services\ScaleReaderService
-sc create "ScaleReaderService" binPath="C:\Services\ScaleReaderService\ScaleReaderService.exe" start= auto
-sc start ScaleReaderService
+dotnet publish -c Release -r win-x64 --self-contained true -o C:\Temp\scale-reader\app
+copy deploy\install-windows.ps1 C:\Temp\scale-reader\
+copy deploy\INSTALL.bat         C:\Temp\scale-reader\
 ```
 
-`--self-contained` bundles the .NET runtime into the output, so the target PC
-needs no .NET install at all. Worth doing on a customer machine even when the
-right runtime happens to be present — it removes a dependency you would
-otherwise have to check on every future update.
+`--self-contained` bundles the .NET runtime, so the target PC needs no .NET at
+all — worth doing even where the right runtime happens to be present, since it
+removes a dependency you would otherwise re-check on every update.
 
-### Updating an Existing Install (Windows)
-
-There is no `install.sh` equivalent on Windows, and a production PC usually has
-neither git nor the .NET SDK. So build the package on a machine that has the
-source, and carry the folder over.
-
-**On the build machine:**
+**On the target PC**, from an **admin** prompt in that folder:
 
 ```bash
-dotnet publish -c Release -r win-x64 --self-contained true -o C:\Temp\scale-reader-update\app
+INSTALL.bat https://valleyag.scaledata.net
 ```
 
-Copy that folder to the target PC (USB, share, RDP drive), then from an
-**admin** command prompt there:
+Or drive the script directly for the full option set:
 
 ```bash
-sc stop ScaleReaderService
-copy "C:\Services\ScaleReaderService\scalereaderservice.db" "%USERPROFILE%\Desktop\scalereaderservice.db.bak"
-robocopy "C:\Temp\scale-reader-update\app" "C:\Services\ScaleReaderService" /E /XF scalereaderservice.db scalereaderservice.db-wal scalereaderservice.db-shm
-sc start ScaleReaderService
+powershell -ExecutionPolicy Bypass -File install-windows.ps1 -WebUrl https://valleyag.scaledata.net -ServiceId valleyag-scale1
 ```
 
-Confirm the install path first if you are not sure of it — `sc qc ScaleReaderService`.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-WebUrl` | *(required)* | Base URL of the web app. Must match its real scheme and port. |
+| `-ServiceId` | `default` | Only needs changing when a site runs more than one reader service. |
+| `-Port` | `5220` | Local Swagger / diagnostic API port. |
+| `-InstallDir` | `C:\Services\ScaleReaderService` | Install location. |
+| `-ResetDb` | off | Start from a clean database. **Destroys** the scale config, serial settings and retained tares — a timestamped backup is taken first regardless. |
+
+The script is idempotent — re-run it to update. It will:
+
+1. Validate the arguments and find the published binaries.
+2. Stop the service and **wait for it to actually stop** (it holds its own
+   `.exe`; copying too early fails with a file lock).
+3. Back up the database to the Desktop, timestamped.
+4. Copy the binaries, excluding the database and its `-wal`/`-shm` companions.
+5. Write `ServerUrl` and the listen port into `appsettings.json`.
+6. Create the service if missing — **automatic startup**, and configured to
+   restart itself on failure (5s, 15s, then every 60s), since a weighbridge PC
+   is rarely watched. An existing service has its path corrected and startup
+   set to automatic.
+7. Start it and poll `/api/status/health` until it answers, failing loudly if
+   it never does.
+8. Apply `ServiceId` and `ServerUrl` **through the API**, not just the config
+   file.
+
+Step 8 matters: `appsettings.json` only seeds the database while `ServerUrl` is
+still the factory default (see the settings patch in `Program.cs`). On an
+existing install, editing the config file alone changes nothing — the API call
+is what makes the script reliable on a machine that has been running for
+months. It triggers a soft reconnect, so the service picks the new URL up
+without restarting.
+
+Confirm the install path first if you are unsure of it — `sc qc ScaleReaderService`.
 
 Three things bite on Windows, all avoidable:
 
