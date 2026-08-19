@@ -1,6 +1,6 @@
 # Scale Reader Service
 
-A .NET 8.0 cross-platform service that reads weight data from industrial scales via IP (SMA 8.1.2 protocol, Mettler Toledo Shared Data, or custom) **or RS-232 serial** (continuous-stream or on-demand indicators) and posts readings to web applications via SignalR.
+A .NET 10.0 cross-platform service that reads weight data from industrial scales via IP (SMA 8.1.2 protocol, Mettler Toledo Shared Data, or custom) **or RS-232 serial** (continuous-stream or on-demand indicators) and posts readings to web applications via SignalR.
 
 ## How It Works
 
@@ -21,6 +21,8 @@ A .NET 8.0 cross-platform service that reads weight data from industrial scales 
 - **Forever retry** — never gives up on SignalR or scale connections
 - **Zero command** — send zero commands to scales via SignalR
 - **Diagnostic endpoint** — view raw SMA responses for troubleshooting
+- **Auto-detect** — listen to a continuous-output indicator and work out its frame layout
+- **Stream tokens** — point the parser at the weight and motion columns by hand when no brand definition fits
 
 ## Supported Protocols
 
@@ -56,6 +58,49 @@ Typical hookup for a Condec UMC indicator streaming continuously at 9600,8,N,1:
 `sudo journalctl -u scale-reader-service -f` shows `frame raw='...' hex=...`
 for every parsed reading, plus loud warnings when the port is silent (wrong
 port/baud) or frames don't parse (wrong protocol/brand).
+
+## Auto-detect and stream tokens
+
+Commissioning an indicator nobody has written a `weightRegex` for used to mean
+guessing. **Auto-Detect**, on the web app's scale setup screen, opens a
+temporary connection with the settings being typed in, listens for a few
+seconds, and reports what the indicator actually streams: the weight
+start/end columns, the motion column and character, and a separate sign
+column for indicators that keep the sign in its own field. It proposes a
+configuration — you review the captured frames and save.
+
+Where no brand definition fits, set the columns by hand in the **Stream
+Tokens** panel. They are stored per scale (`frameParseMode: "Positions"` plus
+`frameWeightStart` / `frameWeightEnd` / `frameMotionIndex` / `frameMotionChar`
+/ `frameSignIndex` / `frameSignNegChar`) and take priority over the brand
+regex on every read path — serial and TCP, streaming and demand. They were
+configured against frames that exact indicator sent, which is better evidence
+than a shared pattern. Clearing them reverts the scale to brand parsing.
+
+Detection is pure — no ports, no sockets, no database — so you can exercise it
+against frames captured any other way, with nothing plugged in:
+
+```bash
+curl -X POST http://localhost:5220/api/detect -H "Content-Type: application/json" \
+  -d '{"frames":["   8980 LB G    ","   8860 LB G MO "]}'
+```
+
+It reports *every* brand whose regex matches, not the first: several
+definitions in the shared repo are loose enough to match any "number + lb"
+frame, so a single match is not evidence of the right model. Confidence
+therefore rests on the columns alone.
+
+When a capture comes back empty the reason distinguishes the causes, because
+each has a different fix:
+
+| Reported | Usually means |
+|---|---|
+| No data arrived at all | Wrong port, baud, data bits or parity — or the indicator is not streaming. If it only replies when polled, put its command in **Request Command** and detect again. |
+| Bytes arrived but no complete frame | Baud/parity mismatch. A hex sample of what arrived is included. |
+| Port is busy | An active scale's reader already holds it — including the scale you are editing. Set **Active** to No, save, then detect. |
+
+Capture reads raw bytes and splits on CR **or** LF rather than assuming the
+terminator, since that is one of the things being discovered.
 
 ## Installation
 
@@ -108,7 +153,7 @@ Options:
 
 The install script will:
 1. Detect system architecture (ARM64, ARM, x64)
-2. Install .NET 8 SDK and runtime permanently (skips download on future updates)
+2. Install the .NET 10 SDK and runtime permanently (skips download on future updates)
 3. Clone and build the service from GitHub
 4. Configure the web server URL
 5. Set up a systemd service that starts on boot
@@ -148,7 +193,7 @@ You should see the new version banner come through:
 
 ```
 ============================================
-  Scale Reader Service v1.2.6
+  Scale Reader Service v1.3.0
   Swagger: http://0.0.0.0:5220/swagger
 ============================================
 ```
@@ -187,9 +232,63 @@ dotnet run
 ### Install as Windows Service
 
 ```bash
-dotnet publish -c Release -o C:\Services\ScaleReaderService
-sc create "ScaleReaderService" binPath="C:\Services\ScaleReaderService\ScaleReaderService.exe"
+dotnet publish -c Release -r win-x64 --self-contained true -o C:\Services\ScaleReaderService
+sc create "ScaleReaderService" binPath="C:\Services\ScaleReaderService\ScaleReaderService.exe" start= auto
 sc start ScaleReaderService
+```
+
+`--self-contained` bundles the .NET runtime into the output, so the target PC
+needs no .NET install at all. Worth doing on a customer machine even when the
+right runtime happens to be present — it removes a dependency you would
+otherwise have to check on every future update.
+
+### Updating an Existing Install (Windows)
+
+There is no `install.sh` equivalent on Windows, and a production PC usually has
+neither git nor the .NET SDK. So build the package on a machine that has the
+source, and carry the folder over.
+
+**On the build machine:**
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained true -o C:\Temp\scale-reader-update\app
+```
+
+Copy that folder to the target PC (USB, share, RDP drive), then from an
+**admin** command prompt there:
+
+```bash
+sc stop ScaleReaderService
+copy "C:\Services\ScaleReaderService\scalereaderservice.db" "%USERPROFILE%\Desktop\scalereaderservice.db.bak"
+robocopy "C:\Temp\scale-reader-update\app" "C:\Services\ScaleReaderService" /E /XF scalereaderservice.db scalereaderservice.db-wal scalereaderservice.db-shm
+sc start ScaleReaderService
+```
+
+Confirm the install path first if you are not sure of it — `sc qc ScaleReaderService`.
+
+Three things bite on Windows, all avoidable:
+
+- **The service locks its own `.exe`.** Copying over a running service fails with
+  a file-lock error. Stop it first, and give Windows a few seconds to release the
+  handle before copying.
+- **The database lives in the application folder** — `AppContext.BaseDirectory`,
+  i.e. `C:\Services\ScaleReaderService\scalereaderservice.db`. It holds the scale
+  configuration, serial port, `ServerUrl`, `ServiceId` and retained tares, and is
+  *not* part of the publish output. Publishing over the existing folder leaves it
+  alone; copying the app folder to a **new** location and switching to that will
+  lose it unless you bring the database across. Exclude its `-wal` and `-shm`
+  companions from the copy too — dropping a stale write-ahead log next to a
+  different database risks corrupting it.
+- **Schema changes apply themselves on start.** New columns are added by the
+  `AddColumnIfMissing` calls in `Program.cs` (this project uses `EnsureCreated`
+  plus hand-written column adds, not EF migrations), so an older database
+  upgrades in place with its rows intact. No manual migration step.
+
+Verify afterwards:
+
+```bash
+sc query ScaleReaderService
+curl http://localhost:5220/api/status/health
 ```
 
 ## Configuration
@@ -212,21 +311,31 @@ All configuration is done via the Swagger API at `http://<your-ip>:<port>/swagge
 |-------|-------------|
 | `scaleId` | Unique ID (e.g., `scale-1`) |
 | `displayName` | Human-readable name |
-| `protocol` | `SMA`, `MettlerToledo`, or `Custom` |
+| `protocol` | `SMA`, `MettlerToledo`, `Custom`, or `Continuous` (hold the connection open and read streamed frames — serial and TCP) |
 | `ipAddress` | Scale IP address |
 | `port` | Scale TCP port (default: 10001) |
 | `requestCommand` | Command sent to request weight (default: `W\r\n`) |
 | `pollingIntervalMs` | Poll frequency in milliseconds (default: 750) |
 | `timeoutMs` | Socket timeout (default: 1000) |
+| `connectionType` | `TCP` or `Serial` |
+| `serialPortName` | e.g. `COM4`, `/dev/ttyUSB0` — required when `connectionType` is `Serial` |
+| `baudRate` / `dataBits` / `parity` / `stopBits` | Serial line settings (default 9600, 8, `None`, 1) |
+| `frameParseMode` | `Brand` (use the brand regex / built-in parsers) or `Positions` |
+| `frameWeightStart` / `frameWeightEnd` | 0-based inclusive column range holding the weight |
+| `frameMotionIndex` / `frameMotionChar` | Column carrying motion, and the character meaning "in motion" |
+| `frameSignIndex` / `frameSignNegChar` | Column holding the sign, for indicators that keep it separate |
 
 ### Diagnostic Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/status/health` | Service health check with scale count |
-| `GET /api/status/weight` | Current weight readings from all scales |
-| `GET /api/status/weight/{scaleId}` | Weight reading from a specific scale |
-| `GET /api/status/diagnostic/{scaleId}` | Raw SMA response for troubleshooting |
+| `GET /api/weight/{scaleId}` | Weight reading from a specific scale (404 until it has been polled) |
+| `GET /api/diagnostic` | Last raw response for every active scale — raw text, hex, parsed values, timing |
+| `GET /api/diagnostic/{scaleId}` | The same for one scale |
+| `GET /api/serialports` | Serial ports this machine offers (for the setup screen's port picker) |
+| `POST /api/detect` | Run format detection against frames you already captured — no hardware needed |
+| `GET /api/status/brands` | Current brand definitions, refreshed from the remote device-definitions repo |
 
 ## Service Management (Linux)
 
@@ -257,6 +366,8 @@ services.msc
 
 ## Requirements
 
-- .NET 8.0 Runtime (installed automatically on Linux via deploy script)
+- .NET 10.0 Runtime — installed automatically on Linux by `deploy/install.sh`, and
+  not needed at all for a `--self-contained` Windows publish, which bundles it
 - Network access to the scale(s) and the BasicWeigh web application
-- TCP connectivity to scale indicators (typically port 10001)
+- TCP connectivity to scale indicators (typically port 10001), or a serial port
+  for RS-232 indicators
