@@ -104,6 +104,14 @@ terminator, since that is one of the things being discovered.
 
 ## Installation
 
+Both platforms have a one-command installer in [`deploy/`](deploy/), and both are
+idempotent — re-run the same command to update.
+
+| Target | Script | Jump to |
+|--------|--------|---------|
+| Linux / Raspberry Pi | `deploy/install.sh` | [Quick Install (Linux / Raspberry Pi)](#quick-install-linux--raspberry-pi) |
+| Windows | `deploy/INSTALL.bat` → `deploy/install-windows.ps1` | [Quick Install / Update (Windows)](#quick-install--update-windows) |
+
 ### Quick Install (Linux / Raspberry Pi)
 
 SSH into the target machine and run one of:
