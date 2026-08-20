@@ -171,7 +171,8 @@ public class ScaleWorker : BackgroundService
             {
                 using var scope = _sp.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
-                var scales = await db.Scales.Where(s => s.Active).OrderBy(s => s.ScaleId).ToListAsync();
+                // Every scale, not just the active ones — see AnnounceScales.
+                var scales = await db.Scales.OrderBy(s => s.ScaleId).ToListAsync();
                 await _connection!.InvokeAsync("ScaleListResponse", new
                 {
                     serviceId = _serviceId,
@@ -391,14 +392,23 @@ public class ScaleWorker : BackgroundService
         {
             using var scope = _sp.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
-            var scales = await db.Scales.Where(s => s.Active).OrderBy(s => s.ScaleId).ToListAsync();
+            // Announce every scale, active or not, and let the web app decide what to do
+            // with each. Filtering to Active here made deactivating a scale look like
+            // deleting it: the row vanished from the setup table and Edit silently did
+            // nothing, so the only way back was to re-create the scale. That collided
+            // head-on with Auto-Detect, which requires the scale to be inactive first
+            // because an active poller holds the serial port open. The setup screen
+            // already renders the active flag as a column, and the pickers that must
+            // only offer live hardware filter on it themselves.
+            var scales = await db.Scales.OrderBy(s => s.ScaleId).ToListAsync();
 
             await _connection.InvokeAsync("ScaleServiceReady", new
             {
                 serviceId = _serviceId,
                 version = ServiceVersion,
                 serverUrl = _serverUrl,
-                scaleCount = scales.Count,
+                // Still the number being polled, which is what this has always meant.
+                scaleCount = scales.Count(s => s.Active),
                 scales = scales.Select(s => new
                 {
                     s.ScaleId, s.DisplayName, s.ScaleBrand,
@@ -415,7 +425,8 @@ public class ScaleWorker : BackgroundService
                 })
             });
 
-            _log.LogInformation("Announced {Count} scale(s) to web app.", scales.Count);
+            _log.LogInformation("Announced {Count} scale(s) to web app, {Active} active.",
+                scales.Count, scales.Count(s => s.Active));
         }
         catch (Exception ex)
         {
