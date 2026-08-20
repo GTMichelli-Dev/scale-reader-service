@@ -71,29 +71,26 @@ public sealed class SerialScaleClient
             DateTime lastFrameLog = DateTime.MinValue;
             DateTime lastNoDataWarn = DateTime.MinValue;
             DateTime lastByteAt = DateTime.UtcNow;
-            int silentTimeouts = 0;
             // After this long with no data, throw out the SerialPort so the outer
             // poller reopens it. Some USB-serial adapters get stuck and need a
             // fresh handle even though the OS still sees the device.
             var portResetAfter = TimeSpan.FromSeconds(30);
 
+            var buffer = new byte[ReadBufferBytes];
+            var pending = new StringBuilder();
+
             while (!ct.IsCancellationRequested)
             {
-                string line;
-                try
+                int read = DrainAvailable(port, buffer);
+                if (read == 0)
                 {
-                    line = await Task.Run(() => ReadLineFlexible(port), ct);
-                }
-                catch (TimeoutException)
-                {
-                    silentTimeouts++;
                     var sinceData = DateTime.UtcNow - lastByteAt;
                     if (sinceData.TotalSeconds >= 5 && (DateTime.UtcNow - lastNoDataWarn).TotalSeconds >= 5)
                     {
                         _log.LogWarning(
-                            "Scale '{ScaleId}' on {Port}: no data received in {Sec:0}s ({Timeouts} read timeouts). " +
+                            "Scale '{ScaleId}' on {Port}: no data received in {Sec:0}s. " +
                             "Check baud/parity, that the scale is powered on and streaming, and that you have the right COM port.",
-                            scale.ScaleId, scale.SerialPortName, sinceData.TotalSeconds, silentTimeouts);
+                            scale.ScaleId, scale.SerialPortName, sinceData.TotalSeconds);
                         lastNoDataWarn = DateTime.UtcNow;
                     }
                     if (sinceData > portResetAfter)
@@ -104,40 +101,61 @@ public sealed class SerialScaleClient
                         throw new IOException(
                             $"No serial data on {scale.SerialPortName} for {sinceData.TotalSeconds:0}s — recycling port.");
                     }
+
+                    // The only await in the loop, and it happens with no read in
+                    // flight — so cancellation always unwinds to a quiet port.
+                    await Task.Delay(PollDelayMs, ct);
                     continue;
                 }
 
                 lastByteAt = DateTime.UtcNow;
-                silentTimeouts = 0;
+                pending.Append(Encoding.ASCII.GetString(buffer, 0, read));
 
-                if (string.IsNullOrWhiteSpace(line)) continue;
+                var lines = TakeLines(pending);
 
-                var frame = ParseSerialFrame(line, brandRegex, positions);
-                frame.RawText = line.Replace("\n", "<LF>").Replace("\r", "<CR>");
-                frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
-
-                // Information-level so it's visible in production, but rate-limited to
-                // ~1 per second so a continuous 10Hz stream doesn't spam the log.
-                if ((DateTime.UtcNow - lastFrameLog).TotalMilliseconds >= 1000)
+                // Whatever survives framing is a partial frame awaiting its terminator.
+                // Once that runs past the cap the stream isn't CR/LF framed at all —
+                // usually the wrong baud rate producing garbage — so drop it instead of
+                // buffering forever. Checked after framing so a large burst that does
+                // contain terminators still yields its frames.
+                if (pending.Length > MaxPendingChars)
                 {
-                    _log.LogInformation(
-                        "Scale '{ScaleId}' frame raw='{Raw}' hex={Hex} -> weight={W} motion={M} ok={Ok} status={S}",
-                        scale.ScaleId, line, frame.RawHex, frame.Weight, frame.Motion, frame.Ok, frame.Status);
-                    lastFrameLog = DateTime.UtcNow;
+                    _log.LogWarning(
+                        "Scale '{ScaleId}' on {Port}: {Count} bytes with no CR/LF terminator — discarding. " +
+                        "This usually means the baud rate, data bits or parity is wrong.",
+                        scale.ScaleId, scale.SerialPortName, pending.Length);
+                    pending.Clear();
                 }
 
-                // Don't let a SignalR/network blip in the consumer kill the read loop.
-                // The poller's job is to keep reading the scale; downstream errors get
-                // logged and the next frame will be tried.
-                try
+                foreach (var line in lines)
                 {
-                    await onFrame(frame);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception ex)
-                {
-                    _log.LogWarning("Scale '{ScaleId}' onFrame handler failed: {Msg}. Continuing read loop.",
-                        scale.ScaleId, ex.Message);
+                    var frame = ParseSerialFrame(line, brandRegex, positions);
+                    frame.RawText = line.Replace("\n", "<LF>").Replace("\r", "<CR>");
+                    frame.RawHex = BitConverter.ToString(Encoding.ASCII.GetBytes(line));
+
+                    // Information-level so it's visible in production, but rate-limited to
+                    // ~1 per second so a continuous 10Hz stream doesn't spam the log.
+                    if ((DateTime.UtcNow - lastFrameLog).TotalMilliseconds >= 1000)
+                    {
+                        _log.LogInformation(
+                            "Scale '{ScaleId}' frame raw='{Raw}' hex={Hex} -> weight={W} motion={M} ok={Ok} status={S}",
+                            scale.ScaleId, line, frame.RawHex, frame.Weight, frame.Motion, frame.Ok, frame.Status);
+                        lastFrameLog = DateTime.UtcNow;
+                    }
+
+                    // Don't let a SignalR/network blip in the consumer kill the read loop.
+                    // The poller's job is to keep reading the scale; downstream errors get
+                    // logged and the next frame will be tried.
+                    try
+                    {
+                        await onFrame(frame);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning("Scale '{ScaleId}' onFrame handler failed: {Msg}. Continuing read loop.",
+                            scale.ScaleId, ex.Message);
+                    }
                 }
             }
         }
@@ -148,14 +166,61 @@ public sealed class SerialScaleClient
         }
     }
 
+    /// <summary>How long to idle between polls when the port has no bytes waiting.</summary>
+    private const int PollDelayMs = 20;
+
+    /// <summary>Size of the scratch buffer each read loop drains the port into.</summary>
+    private const int ReadBufferBytes = 1024;
+
+    /// <summary>Unterminated bytes we'll hold before deciding the framing is wrong.</summary>
+    private const int MaxPendingChars = 4096;
+
     /// <summary>
-    /// SerialPort.ReadLine only splits on NewLine (CR). Some indicators send CR+LF or LF+CR. Strip
-    /// both ends so the parser sees a clean frame regardless of line-ending convention.
+    /// Takes whatever bytes are already buffered on the port, and only those.
+    /// Returns 0 when nothing is waiting.
+    ///
+    /// This never blocks, which is the whole point: the previous implementation
+    /// blocked in SerialPort.ReadLine on a thread-pool thread via Task.Run, and
+    /// cancelling the token only abandoned the await — it left that thread parked
+    /// inside the read while the finally below closed and disposed the port.
+    /// Closing a handle with a read still in flight wedges some USB-serial
+    /// drivers (CH340 especially) hard enough that every later open fails with
+    /// "A device attached to the system is not functioning" until the adapter is
+    /// physically re-plugged. Polling BytesToRead instead means cancellation is
+    /// only ever observed between reads, so the port is always quiet when it closes.
     /// </summary>
-    private static string ReadLineFlexible(SerialPort port)
+    private static int DrainAvailable(SerialPort port, byte[] buffer)
     {
-        string raw = port.ReadLine();
-        return raw.Trim('\r', '\n', '\0', '\x02');
+        int waiting = port.BytesToRead;
+        if (waiting <= 0) return 0;
+        return port.Read(buffer, 0, Math.Min(buffer.Length, waiting));
+    }
+
+    /// <summary>
+    /// Pulls the complete lines out of <paramref name="pending"/>, leaving any partial
+    /// trailing frame behind for the next read to finish. Splits on CR and LF alike, so
+    /// CR, LF, CRLF and LFCR indicators all frame correctly — this replaces
+    /// ReadLineFlexible, which could only split on the single configured NewLine.
+    /// Blank lines are dropped; STX and NUL padding is trimmed off each frame.
+    /// </summary>
+    private static List<string> TakeLines(StringBuilder pending)
+    {
+        var lines = new List<string>();
+        string text = pending.ToString();
+
+        int start = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] != '\r' && text[i] != '\n') continue;
+
+            string line = text[start..i].Trim('\r', '\n', '\0', '\x02');
+            if (line.Length > 0) lines.Add(line);
+            start = i + 1;
+        }
+
+        pending.Clear();
+        pending.Append(text[start..]);
+        return lines;
     }
 
     // Rice Lake 920i / IQ plus 355 EDP/PRN continuous stream:
@@ -574,6 +639,7 @@ public sealed class SerialScaleClient
         }
 
         var requestBytes = BuildRequestBytes(requestCommand);
+        var replyBuffer = new byte[ReadBufferBytes];
         var pollDelay = pollIntervalMs > 0 ? pollIntervalMs : 500;
         DateTime lastFrameLog = DateTime.MinValue;
         DateTime lastByteAt = DateTime.UtcNow;
@@ -591,9 +657,14 @@ public sealed class SerialScaleClient
                         try { port.DiscardInBuffer(); } catch { /* ignore */ }
                     }
 
-                    await Task.Run(() => port.Write(requestBytes, 0, requestBytes.Length), ct);
+                    // Written straight on this thread rather than via Task.Run: with
+                    // Handshake.None a few command bytes go into the driver's output
+                    // buffer and return, and a Task.Run here had the same close-during-
+                    // IO hazard as the read it used to sit beside.
+                    port.Write(requestBytes, 0, requestBytes.Length);
 
-                    var response = await Task.Run(() => ReadUntilCr(port, scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000), ct);
+                    var response = await ReadReplyAsync(
+                        port, replyBuffer, scale.TimeoutMs > 0 ? scale.TimeoutMs : 1000, ct);
 
                     if (string.IsNullOrEmpty(response))
                     {
@@ -656,24 +727,37 @@ public sealed class SerialScaleClient
     }
 
     /// <summary>
-    /// Reads bytes from the port until a CR (0x0D) is seen or timeoutMs elapses.
-    /// Strips leading/trailing CR/LF/NUL on the way out.
+    /// Reads the indicator's reply until a CR (0x0D) is seen or timeoutMs elapses,
+    /// returning whatever arrived. Strips leading/trailing CR/LF/NUL on the way out.
+    ///
+    /// Like the streaming loop, this polls BytesToRead rather than blocking in
+    /// SerialPort.ReadByte, so cancelling mid-poll leaves no read in flight for the
+    /// caller's port.Close() to race against. See DrainAvailable for why that matters.
+    /// Bytes after the CR are dropped, matching the old behaviour — the next poll
+    /// discards the input buffer before sending its request anyway.
     /// </summary>
-    private static string ReadUntilCr(SerialPort port, int timeoutMs)
+    private static async Task<string> ReadReplyAsync(
+        SerialPort port, byte[] buffer, int timeoutMs, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         var sb = new StringBuilder();
+
         while (DateTime.UtcNow < deadline)
         {
-            try
+            int read = DrainAvailable(port, buffer);
+            if (read == 0)
             {
-                int b = port.ReadByte();
-                if (b < 0) break;
-                sb.Append((char)b);
-                if (b == 0x0D) break;
+                await Task.Delay(PollDelayMs, ct);
+                continue;
             }
-            catch (TimeoutException) { break; }
+
+            for (int i = 0; i < read; i++)
+            {
+                sb.Append((char)buffer[i]);
+                if (buffer[i] == 0x0D) return sb.ToString().Trim('\r', '\n', '\0');
+            }
         }
+
         return sb.ToString().Trim('\r', '\n', '\0');
     }
 
@@ -935,10 +1019,17 @@ public sealed class SerialScaleClient
         _ => System.IO.Ports.Parity.None,
     };
 
+    /// <summary>
+    /// Stop bits as stored on the scale row. 0 means "never set" — a row saved before
+    /// the field existed, or one posted without it — and must fall back to 1, the value
+    /// every brand definition and the editor's own default use. It previously mapped 0
+    /// to 1.5, which is only legal alongside 5 data bits: with the usual 8 the DCB is
+    /// rejected and the open fails with a driver-level error that reads like broken
+    /// hardware rather than bad configuration.
+    /// </summary>
     private static StopBits ParseStopBits(int value) => value switch
     {
         2 => System.IO.Ports.StopBits.Two,
-        0 => System.IO.Ports.StopBits.OnePointFive,
         _ => System.IO.Ports.StopBits.One,
     };
 }
