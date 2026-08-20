@@ -19,6 +19,12 @@ public class ScaleWorker : BackgroundService
     private readonly BrandsCache _brands;
     private HubConnection? _connection;
     private string _serviceId = "default";
+    private string _serverUrl = "";
+
+    /// <summary>This service's version, surfaced on the web app's scale screen so
+    /// an operator can see what is deployed without remoting into the box.</summary>
+    private static readonly string ServiceVersion =
+        typeof(ScaleWorker).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
 
     public ScaleWorker(
         IServiceProvider sp,
@@ -62,6 +68,7 @@ public class ScaleWorker : BackgroundService
                     serverUrl = settings?.ServerUrl ?? "http://localhost:5110";
                     hubPath = settings?.SignalRHub ?? "/scaleHub";
                     _serviceId = settings?.ServiceId ?? "default";
+                    _serverUrl = serverUrl;
 
                     // Refresh brands cache so the local file mirrors the remote
                     // by the time the first SignalR client asks.
@@ -168,6 +175,8 @@ public class ScaleWorker : BackgroundService
                 await _connection!.InvokeAsync("ScaleListResponse", new
                 {
                     serviceId = _serviceId,
+                    version = ServiceVersion,
+                    serverUrl = _serverUrl,
                     scales = scales.Select(s => new
                     {
                         s.ScaleId, s.DisplayName, s.ScaleBrand,
@@ -387,6 +396,8 @@ public class ScaleWorker : BackgroundService
             await _connection.InvokeAsync("ScaleServiceReady", new
             {
                 serviceId = _serviceId,
+                version = ServiceVersion,
+                serverUrl = _serverUrl,
                 scaleCount = scales.Count,
                 scales = scales.Select(s => new
                 {

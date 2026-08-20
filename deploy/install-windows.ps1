@@ -45,7 +45,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$WebUrl,
 
-    [string]$ServiceId = "default",
+    [string]$ServiceId = "",
     [int]$Port = 5220,
     [string]$InstallDir = "C:\Services\ScaleReaderService",
     [string]$ServiceName = "ScaleReaderService",
@@ -91,12 +91,55 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Die "This must run from an ADMIN PowerShell. Creating a Windows service needs it."
 }
 
+# ---- Service ID -------------------------------------------------------------
+# Default to the machine name so every install lands on the web app's Scale
+# Management page under a distinct, recognisable identifier - "default" on three
+# boxes is indistinguishable. Mirrors the CameraService installers.
+$dbPathForId = Join-Path $InstallDir "scalereaderservice.db"
+if ([string]::IsNullOrWhiteSpace($ServiceId)) {
+    $isInteractive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    if ($isInteractive) {
+        Write-Host ""
+        Write-Host "Enter a Service ID for this Scale Reader." -ForegroundColor Yellow
+        Write-Host "  Shown on the web app's Scale Management page so each box is identifiable."
+        Write-Host "  Press Enter to use this computer's name: $env:COMPUTERNAME" -ForegroundColor DarkGray
+        $answer = Read-Host "ServiceId"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            $ServiceId = $env:COMPUTERNAME
+            Write-Host "  Using: $ServiceId" -ForegroundColor Cyan
+        } else {
+            $ServiceId = $answer.Trim()
+        }
+        Write-Host ""
+    } else {
+        # Unattended rollouts still land uniquely without passing -ServiceId.
+        $ServiceId = $env:COMPUTERNAME
+    }
+}
+
 Write-Host "  Web app     : $WebUrl"
 Write-Host "  Service ID  : $ServiceId"
 Write-Host "  API port    : $Port"
 Write-Host "  Install dir : $InstallDir"
 Write-Host "  Source      : $appSource"
 if ($ResetDb) { Write-Host "  Database    : RESET (existing config will be destroyed)" -ForegroundColor Yellow }
+
+# A mistyped URL is the classic failure: the service installs cleanly and then
+# reconnects forever against nothing. Say so now, while someone is watching.
+try {
+    $probe = Invoke-WebRequest -Uri $WebUrl -Method Head -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    Write-Host "  Reachable   : yes (HTTP $($probe.StatusCode))" -ForegroundColor Green
+} catch {
+    # A 401/403/404 still proves something is listening, which is the point.
+    $code = $_.Exception.Response.StatusCode.value__
+    if ($code) {
+        Write-Host "  Reachable   : yes (HTTP $code)" -ForegroundColor Green
+    } else {
+        Write-Host "  Reachable   : NO - $WebUrl did not answer within 5s." -ForegroundColor Yellow
+        Write-Host "                The service will install and retry forever. If that URL is" -ForegroundColor Yellow
+        Write-Host "                wrong, Ctrl+C now and re-run with the right one." -ForegroundColor Yellow
+    }
+}
 Write-Host ""
 
 $dbPath      = Join-Path $InstallDir "scalereaderservice.db"
@@ -160,8 +203,11 @@ if (-not (Test-Path $settingsPath)) { Die "appsettings.json missing from $Instal
 $cfg = Get-Content $settingsPath -Raw | ConvertFrom-Json
 if (-not $cfg.Scale) { $cfg | Add-Member -NotePropertyName Scale -NotePropertyValue ([pscustomobject]@{}) -Force }
 $cfg.Scale | Add-Member -NotePropertyName ServerUrl -NotePropertyValue $WebUrl -Force
-# 0.0.0.0 so Swagger is reachable from another machine on the LAN for support.
-$cfg | Add-Member -NotePropertyName Urls -NotePropertyValue "http://0.0.0.0:$Port" -Force
+# "+" binds dual-stack (IPv6 and IPv4). "0.0.0.0" is IPv4-ONLY, and Windows
+# resolves "localhost" to ::1 first - so an IPv4-only bind leaves the service
+# listening yet unreachable by name, which looks exactly like a service that
+# started but never came up.
+$cfg | Add-Member -NotePropertyName Urls -NotePropertyValue "http://+:$Port" -Force
 $cfg | ConvertTo-Json -Depth 10 | Set-Content $settingsPath -Encoding UTF8
 Ok "appsettings.json updated."
 
@@ -209,7 +255,7 @@ $waitFor = 90
 for ($i = 1; $i -le $waitFor; $i++) {
     Start-Sleep -Seconds 1
     try {
-        $health = Invoke-RestMethod "http://localhost:$Port/api/status/health" -TimeoutSec 2
+        $health = Invoke-RestMethod "http://127.0.0.1:$Port/api/status/health" -TimeoutSec 2
         break
     } catch { }
 
@@ -258,7 +304,7 @@ Step 7 "Applying settings..."
 # existing install editing appsettings.json alone would change nothing.
 $body = @{ serviceId = $ServiceId; serverUrl = $WebUrl; signalRHub = "/scaleHub" } | ConvertTo-Json
 try {
-    $applied = Invoke-RestMethod "http://localhost:$Port/api/settings" -Method Put `
+    $applied = Invoke-RestMethod "http://127.0.0.1:$Port/api/settings" -Method Put `
         -ContentType "application/json" -Body $body -TimeoutSec 10
     Ok "ServiceId = $($applied.serviceId)"
     Ok "ServerUrl = $($applied.serverUrl)"

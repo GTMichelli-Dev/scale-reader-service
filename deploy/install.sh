@@ -36,7 +36,7 @@
 set -e
 
 # ---- Defaults ----
-SERVICE_ID="default"
+SERVICE_ID=""      # prompted for below; defaults to $(hostname)
 SERVICE_PORT="5220"
 INSTALL_DIR="/opt/scale-reader-service"
 SERVICE_NAME="scale-reader-service"
@@ -127,6 +127,41 @@ echo ""
 
 # ---- Detect architecture ----
 echo "[1/5] Detecting system..."
+# ---- Service ID ----
+# Default to the machine's hostname so every install lands on the web app's
+# Scale Management page under a distinct, recognisable name - "default" on
+# three boxes is indistinguishable. Mirrors the CameraService installers.
+if [ -z "$SERVICE_ID" ]; then
+    DEFAULT_SERVICE_ID="$(hostname)"
+    if [ -t 0 ]; then
+        echo ""
+        echo "Enter a Service ID for this Scale Reader."
+        echo "  Shown on the web app's Scale Management page so each box is identifiable."
+        echo "  Press Enter to use this machine's name: ${DEFAULT_SERVICE_ID}"
+        read -rp "ServiceId: " INPUT_SERVICE_ID
+        if [ -z "$INPUT_SERVICE_ID" ]; then
+            SERVICE_ID="$DEFAULT_SERVICE_ID"
+            echo "  Using: ${SERVICE_ID}"
+        else
+            SERVICE_ID="$INPUT_SERVICE_ID"
+        fi
+        echo ""
+    else
+        # Unattended rollouts still land uniquely without passing --service-id.
+        SERVICE_ID="$DEFAULT_SERVICE_ID"
+    fi
+fi
+
+# A mistyped URL is the classic failure: the service installs cleanly and then
+# reconnects forever against nothing. Say so now, while someone is watching.
+if curl -fsS --max-time 5 -o /dev/null "${WEB_URL}" 2>/dev/null; then
+    echo "  ${WEB_URL} is reachable."
+else
+    echo "  WARNING: ${WEB_URL} did not answer within 5s."
+    echo "           The service will install and retry forever. If that URL is"
+    echo "           wrong, Ctrl+C now and re-run with the right one."
+fi
+
 ARCH=$(uname -m)
 case "$ARCH" in
     aarch64) RID="linux-arm64" ;;
@@ -369,6 +404,18 @@ sudo systemctl start ${SERVICE_NAME}
 
 # Wait for startup
 sleep 3
+
+# Apply ServiceId and ServerUrl through the API. appsettings.json only seeds the
+# database while ServerUrl is still the factory default, and ServiceId is not
+# read from config at all - so on an existing install neither would otherwise
+# take effect. The API triggers a soft reconnect, no restart needed.
+for _ in $(seq 1 20); do
+    if curl -fsS --max-time 2 -o /dev/null "http://localhost:${SERVICE_PORT}/api/status/health" 2>/dev/null; then
+        curl -fsS -X PUT "http://localhost:${SERVICE_PORT}/api/settings"             -H 'Content-Type: application/json'             -d "{\"serviceId\": \"${SERVICE_ID}\", \"serverUrl\": \"${WEB_URL}\"}"             -o /dev/null 2>/dev/null && echo "  Applied ServiceId=${SERVICE_ID}, ServerUrl=${WEB_URL}"
+        break
+    fi
+    sleep 1
+done
 
 echo ""
 if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
