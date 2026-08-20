@@ -159,9 +159,27 @@ if command -v iptables &> /dev/null; then
     echo "  Firewall: iptables — port ${SERVICE_PORT} opened and persisted."
 fi
 
-# ---- Install .NET 8 ----
-echo "[2/5] Installing .NET runtime..."
+# ---- Prebuilt release package? ----
+#
+# When this script sits next to an "app" folder - the layout of the release
+# tarball - the binaries are already built for this architecture. That skips
+# both the .NET download and the build, turning a multi-minute install on a Pi
+# into seconds, and means the target needs neither git nor the .NET SDK.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREBUILT_DIR="${SCRIPT_DIR}/app"
+if [ -d "${PREBUILT_DIR}" ] && [ -f "${PREBUILT_DIR}/ScaleReaderService" ]; then
+    PREBUILT=true
+else
+    PREBUILT=false
+fi
+
+# ---- Install .NET ----
 DOTNET_ROOT="$HOME/.dotnet"
+
+if [ "$PREBUILT" = true ]; then
+echo "[2/5] Prebuilt package - skipping .NET install (binaries are self-contained)."
+else
+echo "[2/5] Installing .NET runtime..."
 
 if [ -x "$DOTNET_ROOT/dotnet" ]; then
     DOTNET_VER=$("$DOTNET_ROOT/dotnet" --version 2>/dev/null || echo "unknown")
@@ -180,6 +198,8 @@ else
         --install-dir "$DOTNET_ROOT"
     echo "  .NET installed: $($DOTNET_ROOT/dotnet --version)"
 fi
+
+fi   # end of .NET install (skipped for prebuilt packages)
 
 # Ensure dotnet is on PATH
 export PATH="$DOTNET_ROOT:$PATH"
@@ -211,6 +231,23 @@ if [ -f "${INSTALL_DIR}/scalereaderservice.db" ]; then
     cp "${INSTALL_DIR}/scalereaderservice.db" "$DB_BACKUP"
     echo "  Backed up existing database."
 fi
+
+# Prebuilt release package?
+#
+# When this script sits next to an "app" folder - which is how the release
+# tarball is laid out - the binaries are already built for this architecture.
+# Copy them in and skip the SDK download and the build entirely. That turns a
+# multi-minute build on a Pi into a few seconds, and means the target needs
+# neither git nor the .NET SDK.
+if [ "$PREBUILT" = true ]; then
+    echo "  Copying prebuilt binaries..."
+    cp -r "${PREBUILT_DIR}/." "${INSTALL_DIR}/"
+    # A database must never come from a package - it would replace the site's
+    # own scale configuration. Drop any stale write-ahead files too.
+    rm -f "${INSTALL_DIR}/scalereaderservice.db-wal" "${INSTALL_DIR}/scalereaderservice.db-shm"
+fi
+
+if [ "$PREBUILT" = false ]; then
 
 # Clone and build
 CLONE_DIR=$(mktemp -d)
@@ -248,6 +285,8 @@ dotnet publish "${CLONE_DIR}/ScaleReaderService.csproj" \
     -p:PublishTrimmed=false
 
 rm -rf "${CLONE_DIR}"
+
+fi   # end of build-from-source branch
 
 # Restore database if it existed
 if [ -n "$DB_BACKUP" ] && [ -f "$DB_BACKUP" ]; then

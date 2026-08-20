@@ -1,0 +1,146 @@
+name: Release
+
+# Publishes prebuilt, self-contained binaries so a tech can install without
+# git, without the .NET SDK, and without waiting for a build on the target.
+#
+#   git tag v1.3.0 && git push origin v1.3.0
+#
+# Both targets are cross-published from one Linux runner - self-contained
+# publish needs no native toolchain for the target OS.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 1.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # The tag is what techs will quote when reporting a problem, so it has
+          # to agree with the version the service prints at startup. Catching a
+          # mismatch here beats shipping a release labelled differently from the
+          # binary inside it.
+          CSPROJ=$(grep -oPm1 '(?<=<Version>)[^<]+' ScaleReaderService.csproj)
+          if [ "$VERSION" != "$CSPROJ" ]; then
+            echo "::error::Tag version '$VERSION' does not match <Version>$CSPROJ</Version> in ScaleReaderService.csproj."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION"
+
+      - name: Publish win-x64
+        run: |
+          dotnet publish ScaleReaderService.csproj \
+            -c Release -r win-x64 --self-contained true \
+            -o out/win-x64/app
+
+      - name: Publish linux-arm64
+        run: |
+          dotnet publish ScaleReaderService.csproj \
+            -c Release -r linux-arm64 --self-contained true \
+            -o out/linux-arm64/app
+
+      - name: Assemble packages
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # --- Windows: the installer runs straight out of the unzipped folder.
+          cp deploy/install-windows.ps1 deploy/INSTALL.bat deploy/package-README.txt out/win-x64/
+          mv out/win-x64/package-README.txt out/win-x64/README.txt
+          (cd out/win-x64 && zip -qr "../../scale-reader-$V-win-x64.zip" .)
+
+          # --- Linux arm64 (Raspberry Pi 4/5): install.sh finds ./app beside it
+          #     and skips the SDK install and the build entirely.
+          cp deploy/install.sh out/linux-arm64/
+          chmod +x out/linux-arm64/install.sh out/linux-arm64/app/ScaleReaderService
+          tar -czf "scale-reader-$V-linux-arm64.tar.gz" -C out/linux-arm64 .
+
+          ls -lh scale-reader-$V-*
+
+      - name: Smoke-test the Windows build
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          # Confirm the packaged artefacts are actually what we think they are,
+          # rather than discovering it on a customer PC.
+          test -f "out/win-x64/app/ScaleReaderService.exe" || { echo "missing exe"; exit 1; }
+          test -f "out/win-x64/INSTALL.bat"                || { echo "missing INSTALL.bat"; exit 1; }
+          test -f "out/win-x64/install-windows.ps1"        || { echo "missing installer"; exit 1; }
+          test -f "out/linux-arm64/app/ScaleReaderService" || { echo "missing linux binary"; exit 1; }
+          test -f "out/linux-arm64/install.sh"             || { echo "missing install.sh"; exit 1; }
+          # A database must never ship - it would overwrite a site's configuration.
+          if find out -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" | grep -q .; then
+            echo "::error::A database file leaked into the package."
+            exit 1
+          fi
+          echo "Package contents OK"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          NOTES=$(cat <<EOF
+          Prebuilt, self-contained builds of the Scale Reader Service. No .NET,
+          no SDK and no git needed on the target machine.
+
+          ## Windows
+
+          Download \`scale-reader-$V-win-x64.zip\`, unzip it, then from an
+          **admin** command prompt in that folder:
+
+          \`\`\`
+          INSTALL.bat https://your-web-app-url
+          \`\`\`
+
+          Installs the service with automatic startup, keeps the existing
+          database, and applies the web app URL. Re-run the same command to
+          update. Add \`-ResetDb\` to start from a clean database.
+
+          ## Raspberry Pi (64-bit, Pi 4/5)
+
+          \`\`\`
+          curl -fsSL -o srs.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/v$V/scale-reader-$V-linux-arm64.tar.gz
+          mkdir -p /tmp/srs && tar -xzf srs.tar.gz -C /tmp/srs
+          bash /tmp/srs/install.sh https://your-web-app-url
+          \`\`\`
+
+          The URL must match the web app's real scheme and port - a wrong one
+          leaves the service reconnecting forever.
+
+          Other architectures still build from source; see the README.
+          EOF
+          )
+
+          gh release create "v$V" \
+            --title "v$V" \
+            --notes "$NOTES" \
+            "scale-reader-$V-win-x64.zip" \
+            "scale-reader-$V-linux-arm64.tar.gz"
