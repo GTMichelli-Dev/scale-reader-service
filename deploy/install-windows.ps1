@@ -33,6 +33,11 @@
     configuration, serial port settings and retained tares. A timestamped backup
     is taken first regardless.
 
+.PARAMETER SkipUrlCheck
+    Install even if the web app's SignalR hub does not answer cleanly. Only
+    needed when the hub is deliberately behind something this probe cannot
+    satisfy - a redirect here normally means the URL is wrong.
+
 .EXAMPLE
     .\install-windows.ps1 -WebUrl https://valleyag.scaledata.net
 
@@ -49,7 +54,8 @@ param(
     [int]$Port = 5220,
     [string]$InstallDir = "C:\Services\ScaleReaderService",
     [string]$ServiceName = "ScaleReaderService",
-    [switch]$ResetDb
+    [switch]$ResetDb,
+    [switch]$SkipUrlCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -126,18 +132,93 @@ if ($ResetDb) { Write-Host "  Database    : RESET (existing config will be destr
 
 # A mistyped URL is the classic failure: the service installs cleanly and then
 # reconnects forever against nothing. Say so now, while someone is watching.
-try {
-    $probe = Invoke-WebRequest -Uri $WebUrl -Method Head -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-    Write-Host "  Reachable   : yes (HTTP $($probe.StatusCode))" -ForegroundColor Green
-} catch {
-    # A 401/403/404 still proves something is listening, which is the point.
-    $code = $_.Exception.Response.StatusCode.value__
-    if ($code) {
-        Write-Host "  Reachable   : yes (HTTP $code)" -ForegroundColor Green
-    } else {
-        Write-Host "  Reachable   : NO - $WebUrl did not answer within 5s." -ForegroundColor Yellow
+#
+# Probe the SignalR negotiate endpoint the service will actually use, not the
+# site root, and do NOT follow redirects. Both details matter. A plain GET of
+# the root follows a redirect and reports a cheerful "HTTP 200" for a URL the
+# service cannot use: negotiate is a POST, an http->https 301 downgrades it to
+# GET, and the hub answers 405 Method Not Allowed forever. That install looks
+# perfect and never connects.
+# HttpWebRequest rather than Invoke-WebRequest: this runs under Windows
+# PowerShell 5.1, where -MaximumRedirection 0 throws a bare
+# InvalidOperationException carrying no response, so the redirect this exists to
+# catch is invisible. With AllowAutoRedirect off, a 3xx comes back as an ordinary
+# response and the Location header survives.
+function Test-HubEndpoint {
+    param([string]$BaseUrl)
+
+    $uri = "$BaseUrl/scaleHub/negotiate?negotiateVersion=1"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    $resp = $null
+    try {
+        $req = [Net.HttpWebRequest]::Create($uri)
+        $req.Method            = "POST"
+        $req.AllowAutoRedirect = $false
+        $req.Timeout           = 10000
+        $req.ContentLength     = 0
+        $resp = $req.GetResponse()
+        return @{ Status = [int]$resp.StatusCode; Location = $resp.Headers["Location"] }
+    } catch [Net.WebException] {
+        # 4xx/5xx still throw; the response carries the code we want to report.
+        if ($_.Exception.Response) {
+            $r = $_.Exception.Response
+            return @{ Status = [int]$r.StatusCode; Location = $r.Headers["Location"] }
+        }
+        return @{ Status = 0; Error = $_.Exception.Message }
+    } catch {
+        return @{ Status = 0; Error = $_.Exception.Message }
+    } finally {
+        if ($resp) { $resp.Close() }
+    }
+}
+
+if ($SkipUrlCheck) {
+    Write-Host "  Hub check   : skipped (-SkipUrlCheck)" -ForegroundColor Yellow
+} else {
+    $hub = Test-HubEndpoint $WebUrl
+
+    if ($hub.Status -ge 300 -and $hub.Status -lt 400) {
+        # The redirect target is the URL that actually works, so hand it over
+        # rather than making someone guess which scheme or host was meant.
+        $suggest = $WebUrl
+        if ($hub.Location -and $hub.Location -match '^https?://[^/]+') {
+            $suggest = $Matches[0]
+        } elseif ($WebUrl -like 'http://*') {
+            $suggest = $WebUrl -replace '^http://', 'https://'
+        }
+        Write-Host "  Hub check   : REDIRECT (HTTP $($hub.Status))" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  $WebUrl redirects to $($hub.Location)" -ForegroundColor Yellow
+        Write-Host "  SignalR negotiates with a POST, and a redirect turns that into a GET," -ForegroundColor Yellow
+        Write-Host "  which the hub rejects with 405. The service would install cleanly and" -ForegroundColor Yellow
+        Write-Host "  then reconnect forever." -ForegroundColor Yellow
+        Write-Host ""
+        Die "Re-run with the URL the site actually serves:`n         INSTALL.bat $suggest`n`n       Use -SkipUrlCheck to install anyway."
+    }
+    elseif ($hub.Status -eq 200) {
+        Write-Host "  Hub check   : ok (negotiate answered 200)" -ForegroundColor Green
+    }
+    elseif ($hub.Status -eq 401 -or $hub.Status -eq 403) {
+        Write-Host "  Hub check   : reachable, but negotiate returned $($hub.Status)" -ForegroundColor Yellow
+        Write-Host "                The hub is there; it refused this unauthenticated probe." -ForegroundColor Yellow
+    }
+    elseif ($hub.Status -eq 404) {
+        Write-Host "  Hub check   : NO - no /scaleHub at $WebUrl (HTTP 404)" -ForegroundColor Yellow
+        Write-Host "                Right server, wrong app? The service will retry forever." -ForegroundColor Yellow
+        Write-Host "                Ctrl+C now if that URL is wrong." -ForegroundColor Yellow
+    }
+    elseif ($hub.Status -eq 0) {
+        Write-Host "  Hub check   : NO - $WebUrl did not answer within 10s." -ForegroundColor Yellow
+        Write-Host "                $($hub.Error)" -ForegroundColor Yellow
         Write-Host "                The service will install and retry forever. If that URL is" -ForegroundColor Yellow
         Write-Host "                wrong, Ctrl+C now and re-run with the right one." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  Hub check   : unexpected HTTP $($hub.Status) from negotiate" -ForegroundColor Yellow
     }
 }
 Write-Host ""
@@ -167,6 +248,50 @@ if ($existingSvc) {
     Note "Not installed yet - this is a fresh install."
 }
 
+# The Windows service is not the only thing that can hold these binaries. A copy
+# started by hand from a console - the normal way to watch the log while
+# commissioning a scale - keeps ScaleReaderService.exe locked, and "Already
+# stopped" above refers only to the service, so nothing here would notice it.
+# The copy in step 3 then retries against a file that is never going to be
+# released, which reads as a dead installer.
+# Win32_Process rather than Get-Process: ExecutablePath is what decides whether a
+# process is holding THIS install, and Get-Process leaves .Path empty for
+# processes the caller cannot open. That is not supposed to happen once elevated,
+# but a silently empty path here would skip the very instance we came to find.
+function Get-InstalledInstances {
+    param([string]$Dir)
+    return @(Get-CimInstance Win32_Process -Filter "Name='ScaleReaderService.exe'" `
+                 -ErrorAction SilentlyContinue |
+             Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like "$Dir\*" })
+}
+
+$stray = Get-InstalledInstances $InstallDir
+if ($stray.Count -gt 0) {
+    foreach ($p in $stray) {
+        Warn "Running outside the service: pid $($p.ProcessId) - $($p.ExecutablePath)"
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+    $stillThere = Get-InstalledInstances $InstallDir
+    if ($stillThere.Count -gt 0) {
+        Die ("Could not stop the copy running from $InstallDir (pid " +
+             (($stillThere | ForEach-Object { $_.ProcessId }) -join ", ") +
+             "). Close the window running it and re-run.")
+    }
+    Ok "Stopped $($stray.Count) stray instance(s)."
+}
+
+# A copy running from somewhere else cannot lock this install, so it is not
+# stopped - but it will fight for port $Port and the same serial port, so say so.
+$elsewhere = @(Get-CimInstance Win32_Process -Filter "Name='ScaleReaderService.exe'" `
+                   -ErrorAction SilentlyContinue |
+               Where-Object { -not $_.ExecutablePath -or $_.ExecutablePath -notlike "$InstallDir\*" })
+foreach ($p in $elsewhere) {
+    $where = $p.ExecutablePath
+    if (-not $where) { $where = "(path unavailable)" }
+    Warn "Another copy is running from $where (pid $($p.ProcessId)) - it may hold port $Port."
+}
+
 # ------------------------------------------------------------ 2. backup db --
 Step 2 "Backing up database..."
 if (Test-Path $dbPath) {
@@ -185,9 +310,22 @@ if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallD
 # The database lives in the application folder and is not part of the publish
 # output. Exclude it - and its write-ahead companions, since dropping a stale
 # -wal next to a different database risks corrupting it.
-$null = robocopy $appSource $InstallDir /E /NFL /NDL /NJH /NJS /NP `
+# /R and /W are not optional here. Robocopy defaults to a million retries at 30
+# seconds each - roughly a year - and the /N* flags above suppress every word of
+# it, so one locked file turns this step into a silent hang with no way to tell
+# it apart from a crash. Fail in seconds instead and say what is holding the file.
+$null = robocopy $appSource $InstallDir /E /NFL /NDL /NJH /NJS /NP /R:2 /W:5 `
     /XF scalereaderservice.db scalereaderservice.db-wal scalereaderservice.db-shm
-if ($LASTEXITCODE -ge 8) { Die "Copy failed (robocopy $LASTEXITCODE). Is the service really stopped?" }
+if ($LASTEXITCODE -ge 8) {
+    Warn "robocopy exit code $LASTEXITCODE - some files could not be copied."
+    $holding = @(Get-Process -Name "ScaleReaderService" -ErrorAction SilentlyContinue)
+    if ($holding.Count -gt 0) {
+        foreach ($p in $holding) { Warn "Still running: pid $($p.Id) - $($p.Path)" }
+        Die "Something is still holding the binaries. Close it and re-run."
+    }
+    Die ("Copy into $InstallDir failed. Usually a file is locked (antivirus, or an " +
+         "open Explorer/console window in that folder). Close what you can and re-run.")
+}
 Ok "Binaries in place."
 
 if ($ResetDb) {
