@@ -185,18 +185,68 @@ if ($existingSvc) {
 
 # ---------------------------------------------------------- 6. start & wait --
 Step 6 "Starting service..."
+
+# Check the port BEFORE starting. Kestrel dies with "address already in use",
+# which surfaces only as a service that starts and immediately stops - easy to
+# misread as the installer hanging.
+$portOwner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+if ($portOwner) {
+    $op = Get-Process -Id $portOwner.OwningProcess -ErrorAction SilentlyContinue
+    if ($op -and $op.Path -notlike "$InstallDir*") {
+        Die ("Port $Port is already in use by '$($op.Name)' (pid $($op.Id)). " +
+             "The service cannot bind it. Stop that process, or re-run with -Port <other>.")
+    }
+}
+
 Start-Service -Name $ServiceName
-$health = $null
-for ($i = 0; $i -lt 30; $i++) {
+
+# First start on a fresh install is the slow one: a new database, and the
+# antivirus scanning a few hundred just-copied files. Wait generously, but stop
+# early if the service dies - there is nothing to wait for then.
+$health  = $null
+$waitFor = 90
+for ($i = 1; $i -le $waitFor; $i++) {
     Start-Sleep -Seconds 1
     try {
         $health = Invoke-RestMethod "http://localhost:$Port/api/status/health" -TimeoutSec 2
         break
     } catch { }
+
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Running') {
+        Warn "The service stopped on its own after ${i}s - it failed during startup."
+        break
+    }
+    if ($i % 15 -eq 0) { Note "still waiting... ${i}s" }
 }
+
 if (-not $health) {
-    Warn "Service started but the API did not answer on port $Port within 30s."
-    Warn "Check: Get-EventLog -LogName Application -Source .NET* -Newest 20"
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Host ""
+    Warn "The API never answered on port $Port."
+    Warn "Service status : $(if ($svc) { $svc.Status } else { 'not found' })"
+
+    $owner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($owner) {
+        $op = Get-Process -Id $owner.OwningProcess -ErrorAction SilentlyContinue
+        Warn "Port $Port is held by: $($op.Name) (pid $($op.Id))"
+    } else {
+        Warn "Nothing is listening on port $Port."
+    }
+
+    # The actual exception, rather than making the operator go looking for it.
+    Write-Host ""
+    Warn "Recent application errors:"
+    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2;
+                                     StartTime = (Get-Date).AddMinutes(-5) } -ErrorAction SilentlyContinue |
+        Select-Object -First 5 |
+        ForEach-Object { Write-Host ("        " + ($_.Message -split "`n")[0]) -ForegroundColor Yellow }
+
+    Write-Host ""
+    Warn "To see the real error, run it in the foreground:"
+    Warn "  `"$InstallDir\ScaleReaderService.exe`""
     Die "Aborting before settings are applied - the service is not healthy."
 }
 Ok "Healthy - $($health.activeScales) active scale(s)."
