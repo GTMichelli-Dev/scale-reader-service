@@ -74,15 +74,15 @@ jobs:
           # --- Windows: the installer runs straight out of the unzipped folder.
           cp deploy/install-windows.ps1 deploy/INSTALL.bat deploy/package-README.txt out/win-x64/
           mv out/win-x64/package-README.txt out/win-x64/README.txt
-          (cd out/win-x64 && zip -qr "../../scale-reader-$V-win-x64.zip" .)
+          (cd out/win-x64 && zip -qr "../../scale-reader-win-x64.zip" .)
 
           # --- Linux arm64 (Raspberry Pi 4/5): install.sh finds ./app beside it
           #     and skips the SDK install and the build entirely.
           cp deploy/install.sh out/linux-arm64/
           chmod +x out/linux-arm64/install.sh out/linux-arm64/app/ScaleReaderService
-          tar -czf "scale-reader-$V-linux-arm64.tar.gz" -C out/linux-arm64 .
+          tar -czf "scale-reader-linux-arm64.tar.gz" -C out/linux-arm64 .
 
-          ls -lh scale-reader-$V-*
+          ls -lh scale-reader-*
 
       - name: Smoke-test the Windows build
         env:
@@ -113,7 +113,7 @@ jobs:
 
           ## Windows
 
-          Download \`scale-reader-$V-win-x64.zip\`, unzip it, then from an
+          Download \`scale-reader-win-x64.zip\`, unzip it, then from an
           **admin** command prompt in that folder:
 
           \`\`\`
@@ -127,7 +127,7 @@ jobs:
           ## Raspberry Pi (64-bit, Pi 4/5)
 
           \`\`\`
-          curl -fsSL -o srs.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/v$V/scale-reader-$V-linux-arm64.tar.gz
+          curl -fsSL -o srs.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/scale-reader-linux-arm64.tar.gz
           mkdir -p /tmp/srs && tar -xzf srs.tar.gz -C /tmp/srs
           bash /tmp/srs/install.sh https://your-web-app-url
           \`\`\`
@@ -142,5 +142,5 @@ jobs:
           gh release create "v$V" \
             --title "v$V" \
             --notes "$NOTES" \
-            "scale-reader-$V-win-x64.zip" \
-            "scale-reader-$V-linux-arm64.tar.gz"
+            "scale-reader-win-x64.zip" \
+            "scale-reader-linux-arm64.tar.gz"

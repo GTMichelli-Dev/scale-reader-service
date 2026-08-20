@@ -104,13 +104,57 @@ terminator, since that is one of the things being discovered.
 
 ## Installation
 
-Both platforms have a one-command installer in [`deploy/`](deploy/), and both are
-idempotent — re-run the same command to update.
+**Start here: [the latest release](https://github.com/GTMichelli-Dev/scale-reader-service/releases/latest).**
+It carries prebuilt, self-contained binaries, so the target machine needs no
+.NET, no SDK, no git and no build — download one file, run one command.
+
+### Windows — from the release
+
+Download `scale-reader-win-x64.zip`, unzip it, and from an **admin**
+command prompt in that folder:
+
+```bash
+INSTALL.bat https://your-web-app-url
+```
+
+### Raspberry Pi (64-bit, Pi 4/5) — from the release
+
+```bash
+curl -fsSL -o srs.tar.gz https://github.com/GTMichelli-Dev/scale-reader-service/releases/latest/download/scale-reader-linux-arm64.tar.gz
+mkdir -p /tmp/srs && tar -xzf srs.tar.gz -C /tmp/srs
+bash /tmp/srs/install.sh https://your-web-app-url
+```
+
+`install.sh` notices the prebuilt `app` folder beside it and skips both the
+.NET download and the build.
+
+Use the web app's real address — same scheme and port you would type in a
+browser. A wrong URL leaves the service reconnecting forever.
+
+Both installers are idempotent: re-run the same command to update.
+
+### Building from source instead
+
+Needed for architectures the release does not cover (32-bit Pi, Debian x64), or
+when installing a branch. `install.sh` falls back to clone-and-build whenever
+there is no `app` folder beside it.
 
 | Target | Script | Jump to |
 |--------|--------|---------|
 | Linux / Raspberry Pi | `deploy/install.sh` | [Quick Install (Linux / Raspberry Pi)](#quick-install-linux--raspberry-pi) |
 | Windows | `deploy/INSTALL.bat` → `deploy/install-windows.ps1` | [Quick Install / Update (Windows)](#quick-install--update-windows) |
+
+### Cutting a release
+
+Bump `<Version>` in `ScaleReaderService.csproj`, then:
+
+```bash
+git tag v1.3.1 && git push origin v1.3.1
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds both
+targets and publishes the assets. It refuses to build if the tag disagrees with
+the csproj version, or if a database file ever lands in a package.
 
 ### Quick Install (Linux / Raspberry Pi)
 

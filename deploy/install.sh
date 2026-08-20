@@ -89,13 +89,25 @@ done
 if [ -z "$WEB_URL" ]; then
     echo "ERROR: Web server URL is required."
     echo ""
-    echo "Usage:"
-    echo "  git clone https://github.com/${GITHUB_REPO}.git /tmp/srs"
-    echo "  bash /tmp/srs/deploy/install.sh <web-server-url>"
-    echo ""
-    echo "Examples:"
-    echo "  bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net   # production"
-    echo "  bash /tmp/srs/deploy/install.sh http://localhost                   # LAN Pi, web on :80"
+    # Show the invocation that matches how this copy was obtained. Telling
+    # someone running the release tarball to git clone sends them down the
+    # build-from-source path they downloaded a prebuilt package to avoid.
+    if [ -f "$(dirname "${BASH_SOURCE[0]}")/app/ScaleReaderService" ]; then
+        echo "Usage:"
+        echo "  bash $(dirname "${BASH_SOURCE[0]}")/install.sh <web-server-url>"
+        echo ""
+        echo "Examples:"
+        echo "  bash $(dirname "${BASH_SOURCE[0]}")/install.sh https://basicscale.scaledata.net   # production"
+        echo "  bash $(dirname "${BASH_SOURCE[0]}")/install.sh http://localhost                   # LAN Pi, web on :80"
+    else
+        echo "Usage:"
+        echo "  git clone https://github.com/${GITHUB_REPO}.git /tmp/srs"
+        echo "  bash /tmp/srs/deploy/install.sh <web-server-url>"
+        echo ""
+        echo "Examples:"
+        echo "  bash /tmp/srs/deploy/install.sh https://basicscale.scaledata.net   # production"
+        echo "  bash /tmp/srs/deploy/install.sh http://localhost                   # LAN Pi, web on :80"
+    fi
     echo ""
     echo "Run with --help for all options."
     exit 1
