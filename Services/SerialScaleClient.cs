@@ -927,6 +927,16 @@ public sealed class SerialScaleClient
                 }
                 catch (DirectoryNotFoundException) { /* no /dev — nothing to add */ }
             }
+
+            // /dev/serial/by-id names carry the adapter's own vendor/model/serial,
+            // so they keep pointing at the same physical cable after a replug that
+            // renumbers ttyUSB*. Offered alongside the raw devices and sorted ahead
+            // of them, so the picker's first suggestion is the one that survives.
+            try
+            {
+                foreach (var link in Directory.GetFiles("/dev/serial/by-id")) ports.Add(link);
+            }
+            catch (DirectoryNotFoundException) { /* no USB serial adapters attached */ }
         }
         return ports.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
     }
