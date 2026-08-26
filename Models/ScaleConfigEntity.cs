@@ -103,4 +103,33 @@ public class ScaleConfigEntity
     /// <summary>Character in FrameSignIndex that means negative (typically "-").</summary>
     [StringLength(1)]
     public string? FrameSignNegChar { get; set; }
+
+    // ---- On-scale detectors (Pi GPIO inputs) ----
+    // Photo-eyes or loops mounted at each end of the deck, wired to two Pi
+    // inputs. A detector reads active when something is breaking the beam at
+    // that end, which means the truck is hanging off the platform and the
+    // weight on the deck is not the whole truck. Optional throughout: a pin
+    // left null is never read, so a site with no detectors — or any install on
+    // hardware without GPIO — reports "on scale" forever and behaves exactly
+    // as it did before.
+
+    /// <summary>BCM pin for the detector at the approach end, or null when
+    /// nothing is wired there.</summary>
+    public int? EndDetectorPin1 { get; set; }
+
+    /// <summary>BCM pin for the detector at the exit end, or null.</summary>
+    public int? EndDetectorPin2 { get; set; }
+
+    /// <summary>
+    /// True when the detectors pull the input LOW while blocked, which is how
+    /// most photo-eyes with a pull-up are wired. False reads HIGH as blocked.
+    /// </summary>
+    public bool InvertDetectorPins { get; set; }
+
+    /// <summary>
+    /// Enable an internal pull-up on the detector inputs. Wanted for a dry
+    /// contact or open-collector sensor that only pulls to ground; leave off
+    /// when the sensor drives both states itself.
+    /// </summary>
+    public bool DetectorPullUp { get; set; } = true;
 }

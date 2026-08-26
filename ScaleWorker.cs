@@ -17,6 +17,7 @@ public class ScaleWorker : BackgroundService
     private readonly SerialScaleClient _serialClient;
     private readonly ScaleWeightStore _weightStore;
     private readonly BrandsCache _brands;
+    private readonly GpioInputs _gpio;
     private HubConnection? _connection;
     private string _serviceId = "default";
     private string _serverUrl = "";
@@ -34,7 +35,8 @@ public class ScaleWorker : BackgroundService
         SmaClient smaClient,
         SerialScaleClient serialClient,
         ScaleWeightStore weightStore,
-        BrandsCache brands)
+        BrandsCache brands,
+        GpioInputs gpio)
     {
         _sp = sp;
         _log = log;
@@ -44,7 +46,18 @@ public class ScaleWorker : BackgroundService
         _serialClient = serialClient;
         _weightStore = weightStore;
         _brands = brands;
+        _gpio = gpio;
     }
+
+    /// <summary>
+    /// Is the truck fully on this scale's deck? False only when a detector at
+    /// one end of the platform is blocked, which the web app turns into a
+    /// "NOT ON SCALE" refusal. A scale with no detector pins configured is
+    /// always on-scale, so this is inert until a site wires them up.
+    /// </summary>
+    private bool IsOnScale(ScaleConfigEntity scale) =>
+        !_gpio.AnyDetectorActive(scale.EndDetectorPin1, scale.EndDetectorPin2,
+                                 scale.InvertDetectorPins, scale.DetectorPullUp);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -342,6 +355,13 @@ public class ScaleWorker : BackgroundService
                     existing.FrameSignIndex = update.FrameSignIndex;
                     existing.FrameSignNegChar = update.FrameSignNegChar;
 
+                    // Detector pins are assigned straight across for the same
+                    // reason: clearing a pin is how a site removes a detector.
+                    existing.EndDetectorPin1 = update.EndDetectorPin1;
+                    existing.EndDetectorPin2 = update.EndDetectorPin2;
+                    existing.InvertDetectorPins = update.InvertDetectorPins;
+                    existing.DetectorPullUp = update.DetectorPullUp;
+
                     existing.Active = update.Active;
                 }
                 await db.SaveChangesAsync();
@@ -421,6 +441,8 @@ public class ScaleWorker : BackgroundService
                     s.FrameWeightStart, s.FrameWeightEnd,
                     s.FrameMotionIndex, s.FrameMotionChar,
                     s.FrameSignIndex, s.FrameSignNegChar,
+                    s.EndDetectorPin1, s.EndDetectorPin2,
+                    s.InvertDetectorPins, s.DetectorPullUp,
                     s.Active
                 })
             });
@@ -870,6 +892,7 @@ public class ScaleWorker : BackgroundService
                         motion = frame.Motion,
                         ok = frame.Ok,
                         status = frame.Status,
+                        onScale = IsOnScale(scale),
                         rawResponse = frame.RawText,
                         rawHex = frame.RawHex,
                         lastUpdate = DateTime.Now
@@ -928,6 +951,7 @@ public class ScaleWorker : BackgroundService
                             motion = frame.Motion,
                             ok = frame.Ok,
                             status = frame.Status,
+                            onScale = IsOnScale(scale),
                             rawResponse = frame.RawText,
                             rawHex = frame.RawHex,
                             lastUpdate = DateTime.Now
@@ -998,6 +1022,7 @@ public class ScaleWorker : BackgroundService
                 motion,
                 ok,
                 status,
+                onScale = IsOnScale(scale),
                 rawResponse = rawText,
                 rawHex,
                 lastUpdate = DateTime.Now
@@ -1031,6 +1056,9 @@ public class ScaleWorker : BackgroundService
                     motion = false,
                     ok = false,
                     status = "Disconnected",
+                    // A dead feed has no detector opinion worth acting on, and
+                    // the scale error stops the weighment on its own.
+                    onScale = true,
                     lastUpdate = DateTime.Now
                 }, ct);
             }

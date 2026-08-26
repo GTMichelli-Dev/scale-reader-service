@@ -60,6 +60,10 @@ builder.Services.AddSingleton<AnnounceSignal>();
 // In-memory weight store (latest reading per scale)
 builder.Services.AddSingleton<ScaleWeightStore>();
 
+// On-scale end detectors (Pi GPIO inputs). Safe to register everywhere — it
+// reports "not blocked" on any machine without a GPIO chip.
+builder.Services.AddSingleton<GpioInputs>();
+
 // Controllers + Swagger
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -109,6 +113,12 @@ using (var scope = app.Services.CreateScope())
     AddColumnIfMissing(db, "Scales", "FrameMotionChar", "TEXT NULL");
     AddColumnIfMissing(db, "Scales", "FrameSignIndex", "INTEGER NULL");
     AddColumnIfMissing(db, "Scales", "FrameSignNegChar", "TEXT NULL");
+    AddColumnIfMissing(db, "Scales", "EndDetectorPin1", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "EndDetectorPin2", "INTEGER NULL");
+    AddColumnIfMissing(db, "Scales", "InvertDetectorPins", "INTEGER NOT NULL DEFAULT 0");
+    // Defaults to on: a dry contact is the common case, and a sensor that
+    // drives both states is unaffected by the pull-up.
+    AddColumnIfMissing(db, "Scales", "DetectorPullUp", "INTEGER NOT NULL DEFAULT 1");
 
     // Seed from appsettings.json if no scales exist yet
     if (!db.Scales.Any())

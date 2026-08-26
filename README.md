@@ -23,6 +23,7 @@ A .NET 10.0 cross-platform service that reads weight data from industrial scales
 - **Diagnostic endpoint** — view raw SMA responses for troubleshooting
 - **Auto-detect** — listen to a continuous-output indicator and work out its frame layout
 - **Stream tokens** — point the parser at the weight and motion columns by hand when no brand definition fits
+- **On-scale detectors** — optional GPIO inputs at each end of the deck that tell the web app when a truck is hanging off the platform
 
 ## Supported Protocols
 
@@ -369,6 +370,30 @@ Verify afterwards:
 sc query ScaleReaderService
 curl http://localhost:5220/api/status/health
 ```
+
+## On-scale detectors (Raspberry Pi)
+
+Photo-eyes or loops at each end of the weighbridge, wired to two GPIO inputs.
+While either one is blocked, part of the truck is off the platform and the
+reading on the deck is not the whole vehicle — so the service reports the scale
+as *not occupied* and the web app shows **NOT ON SCALE** and refuses to capture
+a weight, on the kiosk, the phone page and the office weigh forms alike.
+
+Four optional fields per scale, set through the scale API or the web app's
+scale screen:
+
+| Field | Meaning |
+|---|---|
+| `endDetectorPin1` | BCM pin for the approach-end detector. Null if none wired. |
+| `endDetectorPin2` | BCM pin for the exit-end detector. Null if none wired. |
+| `invertDetectorPins` | True when a blocked beam pulls the input LOW, which is how most photo-eyes with a pull-up are wired. |
+| `detectorPullUp` | Enable the internal pull-up. Wanted for a dry contact or open-collector sensor; harmless for one that drives both states. Default on. |
+
+The whole feature is inert until pins are set. Leave them null — or run on any
+machine without a GPIO chip, including Windows — and every scale reports as
+occupied forever, exactly as it did before detectors existed. That direction of
+failure is deliberate: the alternative would be an install with no GPIO refusing
+every weighment on the site.
 
 ## Configuration
 
