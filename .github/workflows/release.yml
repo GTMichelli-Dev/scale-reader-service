@@ -136,6 +136,14 @@ jobs:
           leaves the service reconnecting forever.
 
           Other architectures still build from source; see the README.
+
+          ## Pi git auth
+
+          Nothing above needs git on the target - that is the point of shipping
+          prebuilt. A Pi that also has to \`git clone\` or \`git pull\` a
+          **private** GTMichelli-Dev repo needs a one-time bootstrap first:
+
+          https://github.com/GTMichelli-Dev/pi-git-auth
           EOF
           )
 
