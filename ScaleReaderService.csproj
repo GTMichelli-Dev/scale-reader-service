@@ -4,10 +4,15 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!--
+      Fallback for local builds. The release workflow passes -p:Version from the
+      git tag, so a published service reports the release it shipped in. Leave
+      AssemblyVersion, FileVersion and InformationalVersion unset: the SDK
+      derives all three from Version, and setting them here would pin them past
+      anything the tag says — a command-line Version overrides this property but
+      not siblings assigned next to it.
+    -->
     <Version>1.4.0</Version>
-    <AssemblyVersion>1.4.0.0</AssemblyVersion>
-    <FileVersion>1.4.0.0</FileVersion>
-    <InformationalVersion>1.4.0</InformationalVersion>
     <Product>Scale Reader Service</Product>
     <Description>Reads weight data from industrial scales via IP (SMA, Mettler Toledo) and posts to web applications via SignalR.</Description>
   </PropertyGroup>

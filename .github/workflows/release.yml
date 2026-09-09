@@ -53,17 +53,21 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building $VERSION"
 
+      # -p:Version so the built service reports the release it shipped in. The
+      # csproj version was previously hand-edited to match each tag, which held
+      # only as long as someone remembered — Foundation's Setup > Services tab
+      # reads this, and a stale number there is worse than none.
       - name: Publish win-x64
         run: |
           dotnet publish ScaleReaderService.csproj \
             -c Release -r win-x64 --self-contained true \
-            -o out/win-x64/app
+            -o out/win-x64/app -p:Version="${{ steps.ver.outputs.version }}"
 
       - name: Publish linux-arm64
         run: |
           dotnet publish ScaleReaderService.csproj \
             -c Release -r linux-arm64 --self-contained true \
-            -o out/linux-arm64/app
+            -o out/linux-arm64/app -p:Version="${{ steps.ver.outputs.version }}"
 
       - name: Assemble packages
         env:
