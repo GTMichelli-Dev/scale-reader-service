@@ -402,6 +402,33 @@ public class ScaleWorker : BackgroundService
     private async Task JoinGroups()
     {
         await _connection!.InvokeAsync("JoinScaleGroup", _serviceId);
+        await ReportVersion();
+    }
+
+    /// <summary>
+    /// Tells the server which build is running out here, for Setup > Services —
+    /// the same ServiceVersion the scale screen already shows, so the two cannot
+    /// drift apart.
+    ///
+    /// Reported as not released with the server: this service has its own repo
+    /// and its own release line, so Foundation's version is not a yardstick for
+    /// it. The Services tab shows the version without a verdict.
+    ///
+    /// Best effort by design: a server older than this handshake has no such hub
+    /// method and will fault the invocation. That must not take the connection
+    /// down with it — reporting weights matters, reporting a version does not.
+    /// </summary>
+    private async Task ReportVersion()
+    {
+        try
+        {
+            await _connection!.InvokeAsync("ReportServiceVersion",
+                "Scale reader", _serviceId, ServiceVersion, false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Server did not accept a version report; it is probably older than this build.");
+        }
     }
 
     private async Task AnnounceScales()
