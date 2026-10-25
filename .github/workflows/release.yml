@@ -141,6 +141,28 @@ jobs:
 
           Other architectures still build from source; see the README.
 
+          ## Several sites
+
+          One scale can work for several Foundation sites at once - a scale house
+          several companies share, for example. Give every site's URL. On Windows,
+          in quotes and separated by commas (unquoted, Windows splits the list at
+          each comma):
+
+          \`\`\`
+          INSTALL.bat "https://site-one.example.com,https://site-two.example.com"
+          \`\`\`
+
+          On a Pi, separated by spaces:
+
+          \`\`\`
+          bash /tmp/srs/install.sh https://site-one.example.com https://site-two.example.com
+          \`\`\`
+
+          Each site gets its own connection and retries. The scale is read once and
+          every weight goes to every connected site; a request (scale list,
+          Auto-Detect, setup changes) is answered to the site that asked. Set the
+          scale up once; then on **each** site, pick it on the Scales page.
+
           ## Pi git auth
 
           Nothing above needs git on the target - that is the point of shipping
