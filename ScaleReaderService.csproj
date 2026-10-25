@@ -16,7 +16,7 @@
       anything the tag says — a command-line Version overrides this property but
       not siblings assigned next to it.
     -->
-    <Version>1.4.1</Version>
+    <Version>1.5.0</Version>
     <Product>Scale Reader Service</Product>
     <Description>Reads weight data from industrial scales via IP (SMA, Mettler Toledo) and posts to web applications via SignalR.</Description>
   </PropertyGroup>

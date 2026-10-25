@@ -17,7 +17,8 @@ public class ServiceSettings
 
     /// <summary>Base URL of the web application (e.g. "http://localhost:5110")</summary>
     [Required]
-    [StringLength(200)]
+    // One site, or several separated by commas (see Services.ServerUrls).
+    [StringLength(1000)]
     public string ServerUrl { get; set; } = "http://localhost:5110";
 
     /// <summary>SignalR hub path on the web app (e.g. "/scaleHub")</summary>

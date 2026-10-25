@@ -23,6 +23,10 @@
 #   bash /tmp/srs/deploy/install.sh http://localhost --service-id plant-1 --port 5220
 #   rm -rf /tmp/srs
 #
+#   # One scale several companies share: every company's site, separated by
+#   # spaces or commas. Each gets the weights and sees the scale as its own.
+#   bash /tmp/srs/deploy/install.sh https://agnw.scaledata.net https://crs.scaledata.net
+#
 # Pick the URL to match the web app's *actual* listen port. The LAN-only Pi
 # deploy binds Kestrel to :80 (see web README), so the right URL is
 # http://localhost — not http://localhost:5110 (which is the dev default).
@@ -53,9 +57,11 @@ while [[ $# -gt 0 ]]; do
         --branch)     BRANCH="$2"; shift 2 ;;
         --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: install.sh <web-server-url> [options]"
+            echo "Usage: install.sh <web-server-url> [<web-server-url> ...] [options]"
             echo ""
-            echo "  <web-server-url>       Required. URL of the BasicWeigh web server."
+            echo "  <web-server-url>       Required. URL of the Foundation web server."
+            echo "                         Several sites share this scale: give each URL,"
+            echo "                         separated by spaces or commas."
             echo "                         Must match the web app's actual listen port."
             echo "                         Examples:"
             echo "                           https://basicscale.scaledata.net   (production)"
@@ -75,11 +81,12 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
         *)
+            # Each URL is another site this scale works for; the service keeps
+            # them as one comma-separated ServerUrl.
             if [ -z "$WEB_URL" ]; then
                 WEB_URL="$1"
             else
-                echo "Unknown argument: $1"
-                exit 1
+                WEB_URL="${WEB_URL},$1"
             fi
             shift
             ;;
@@ -160,54 +167,58 @@ fi
 # instead reports a happy "reachable" for a URL the service cannot use:
 # negotiate is a POST, an http->https redirect downgrades it to GET, and the
 # hub answers 405 Method Not Allowed forever.
-HUB_PROBE=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST --max-time 10 \
-    "${WEB_URL}/scaleHub/negotiate?negotiateVersion=1" 2>/dev/null || echo "000 ")
-HUB_CODE=${HUB_PROBE%% *}
-HUB_LOC=${HUB_PROBE#* }
+# Each site is checked on its own: one wrong URL in a list is as bad as one
+# wrong URL alone.
+for CHECK_URL in $(echo "$WEB_URL" | tr ',;' '  '); do
+    HUB_PROBE=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST --max-time 10 \
+        "${CHECK_URL}/scaleHub/negotiate?negotiateVersion=1" 2>/dev/null || echo "000 ")
+    HUB_CODE=${HUB_PROBE%% *}
+    HUB_LOC=${HUB_PROBE#* }
 
-case "$HUB_CODE" in
-    200)
-        echo "  ${WEB_URL} hub check: ok (negotiate answered 200)."
-        ;;
-    30[0-9])
-        echo ""
-        echo "  ERROR: ${WEB_URL} redirects to ${HUB_LOC}"
-        echo ""
-        echo "  SignalR negotiates with a POST, and a redirect turns that into a GET,"
-        echo "  which the hub rejects with 405. The service would install cleanly and"
-        echo "  then reconnect forever."
-        echo ""
-        SUGGEST=$(echo "$HUB_LOC" | sed -E 's#^(https?://[^/]+).*#\1#')
-        [ -z "$SUGGEST" ] && SUGGEST=$(echo "$WEB_URL" | sed 's#^http://#https://#')
-        echo "  Re-run with the URL the site actually serves:"
-        echo "    bash install.sh ${SUGGEST}"
-        echo ""
-        if [ "${SKIP_URL_CHECK:-0}" = "1" ]; then
-            echo "  SKIP_URL_CHECK=1 is set - installing anyway."
+    case "$HUB_CODE" in
+        200)
+            echo "  ${CHECK_URL} hub check: ok (negotiate answered 200)."
+            ;;
+        30[0-9])
             echo ""
-        else
-            echo "  Set SKIP_URL_CHECK=1 to install anyway."
+            echo "  ERROR: ${CHECK_URL} redirects to ${HUB_LOC}"
             echo ""
-            exit 1
-        fi
-        ;;
-    401|403)
-        echo "  ${WEB_URL} hub check: reachable, negotiate returned ${HUB_CODE}."
-        echo "           The hub is there; it refused this unauthenticated probe."
-        ;;
-    404)
-        echo "  WARNING: no /scaleHub at ${WEB_URL} (HTTP 404)."
-        echo "           Right server, wrong app? The service will retry forever."
-        ;;
-    000)
-        echo "  WARNING: ${WEB_URL} did not answer within 10s."
-        echo "           The service will install and retry forever. If that URL is"
-        echo "           wrong, Ctrl+C now and re-run with the right one."
-        ;;
-    *)
-        echo "  WARNING: negotiate at ${WEB_URL} returned HTTP ${HUB_CODE}."
-        ;;
-esac
+            echo "  SignalR negotiates with a POST, and a redirect turns that into a GET,"
+            echo "  which the hub rejects with 405. The service would install cleanly and"
+            echo "  then reconnect forever."
+            echo ""
+            SUGGEST=$(echo "$HUB_LOC" | sed -E 's#^(https?://[^/]+).*#\1#')
+            [ -z "$SUGGEST" ] && SUGGEST=$(echo "$CHECK_URL" | sed 's#^http://#https://#')
+            echo "  Re-run with the URL the site actually serves:"
+            echo "    bash install.sh ${SUGGEST}"
+            echo ""
+            if [ "${SKIP_URL_CHECK:-0}" = "1" ]; then
+                echo "  SKIP_URL_CHECK=1 is set - installing anyway."
+                echo ""
+            else
+                echo "  Set SKIP_URL_CHECK=1 to install anyway."
+                echo ""
+                exit 1
+            fi
+            ;;
+        401|403)
+            echo "  ${CHECK_URL} hub check: reachable, negotiate returned ${HUB_CODE}."
+            echo "           The hub is there; it refused this unauthenticated probe."
+            ;;
+        404)
+            echo "  WARNING: no /scaleHub at ${CHECK_URL} (HTTP 404)."
+            echo "           Right server, wrong app? The service will retry forever."
+            ;;
+        000)
+            echo "  WARNING: ${CHECK_URL} did not answer within 10s."
+            echo "           The service will install and retry forever. If that URL is"
+            echo "           wrong, Ctrl+C now and re-run with the right one."
+            ;;
+        *)
+            echo "  WARNING: negotiate at ${CHECK_URL} returned HTTP ${HUB_CODE}."
+            ;;
+    esac
+done
 
 ARCH=$(uname -m)
 case "$ARCH" in

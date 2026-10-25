@@ -24,6 +24,12 @@ The same command handles a fresh install and an update, and is safe to re-run.
     INSTALL.bat https://your-web-app-url -ServiceId site-a
         Name this reader, when a site runs more than one.
 
+    INSTALL.bat "https://agnw.scaledata.net,https://crs.scaledata.net"
+        One scale several companies share: every company's site, in quotes and
+        separated by commas (unquoted, Windows splits the list at each comma).
+        One connection per site, each with its own retries. Every connected
+        site gets the weights and sets up the scale on its own Scales page.
+
     powershell -ExecutionPolicy Bypass -File install-windows.ps1 -?
         All options, including -Port and -InstallDir.
 

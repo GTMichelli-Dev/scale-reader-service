@@ -11,6 +11,10 @@ REM    INSTALL.bat https://valleyag.scaledata.net
 REM    INSTALL.bat https://valleyag.scaledata.net -ResetDb
 REM    INSTALL.bat https://valleyag.scaledata.net -ServiceId valleyag-scale1
 REM
+REM  One scale several companies share: every company's site, in quotes and
+REM  separated by commas (unquoted, Windows splits the list at each comma).
+REM    INSTALL.bat "https://agnw.scaledata.net,https://crs.scaledata.net"
+REM
 REM  Everything after the URL is passed through to install-windows.ps1.
 REM  Run  powershell -File install-windows.ps1 -?  to see all options.
 REM ===========================================================================

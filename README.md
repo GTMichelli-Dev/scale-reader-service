@@ -4,7 +4,7 @@ A .NET 10.0 cross-platform service that reads weight data from industrial scales
 
 ## How It Works
 
-1. The service connects to the BasicWeigh web app via SignalR
+1. The service connects to the BasicWeigh web app via SignalR — or to several Foundation sites at once, one connection each (see [Several sites](#several-sites))
 2. It polls one or more scales via TCP/IP at a configurable interval (default 750ms)
 3. Weight readings are parsed using the SMA 8.1.2 standard and broadcast to all web clients in real-time
 4. Supports automatic reconnection with exponential backoff on connection loss
@@ -133,6 +133,23 @@ Use the web app's real address — same scheme and port you would type in a
 browser. A wrong URL leaves the service reconnecting forever.
 
 Both installers are idempotent: re-run the same command to update.
+
+### Several sites
+
+One scale several companies share serves every company's site. Give each
+site's URL. On Linux, separate them with spaces or commas; on Windows, put the
+list in quotes, separated by commas (unquoted, Windows splits it at each comma):
+
+```bash
+bash /tmp/srs/install.sh https://agnw.scaledata.net https://crs.scaledata.net
+INSTALL.bat "https://agnw.scaledata.net,https://crs.scaledata.net"
+```
+
+They are kept as one comma-separated `serverUrl`. The service opens one
+connection per site, each with its own retries, so a site that is down does not
+affect the others. Every connected site gets the weights. The scale is set up
+once here; each site sees the service as its own and sets up its scale on its
+own **Scales** page.
 
 ### Building from source instead
 
@@ -404,7 +421,7 @@ All configuration is done via the Swagger API at `http://<your-ip>:<port>/swagge
 | Setting | Description |
 |---------|-------------|
 | `serviceId` | Unique ID for this service instance (used by the web app to identify it) |
-| `serverUrl` | BasicWeigh web server URL (e.g., `https://basicscale.scaledata.net`) |
+| `serverUrl` | BasicWeigh web server URL (e.g., `https://basicscale.scaledata.net`). Several sites: separate the URLs with commas, semicolons, spaces or new lines — see [Several sites](#several-sites) |
 | `signalRHub` | SignalR hub path (default: `/scaleHub`) |
 | `brandsUrl` | URL to remote scale-models.json for protocol definitions |
 | `brandsToken` | GitHub token for private repos (optional) |

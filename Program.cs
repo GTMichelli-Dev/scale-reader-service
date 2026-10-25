@@ -40,7 +40,10 @@ builder.Services.AddSingleton<BrandsCache>();
 // HTTP client for calling web API
 builder.Services.AddHttpClient("BasicWeighApi", client =>
 {
-    var serverUrl = builder.Configuration["Scale:ServerUrl"] ?? "http://localhost:5110";
+    // ServerUrl may list several sites (ServerUrls); this client only ever
+    // needs one, so it takes the first.
+    var serverUrl = ScaleReaderService.Services.ServerUrls.Parse(builder.Configuration["Scale:ServerUrl"]).FirstOrDefault()
+                    ?? "http://localhost:5110";
     client.BaseAddress = new Uri(serverUrl);
     client.Timeout = TimeSpan.FromSeconds(30);
 });

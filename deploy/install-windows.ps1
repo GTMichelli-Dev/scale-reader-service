@@ -77,10 +77,17 @@ Write-Host ""
 # in any prompt, rather than only after the operator re-opens one as admin.
 
 # Catch the wrong-URL mistake here rather than after a silent reconnect loop.
-if ($WebUrl -notmatch '^https?://') {
-    Die "WebUrl must start with http:// or https:// - got '$WebUrl'"
+# One scale several companies share serves each company's site: -WebUrl takes
+# several, separated by commas (quote them for INSTALL.bat), and the service
+# keeps them as one comma-separated ServerUrl.
+$Sites = @($WebUrl -split '[,;\s]+' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('/') })
+if ($Sites.Count -eq 0) { Die "WebUrl is required." }
+foreach ($site in $Sites) {
+    if ($site -notmatch '^https?://') {
+        Die "WebUrl must start with http:// or https:// - got '$site'"
+    }
 }
-$WebUrl = $WebUrl.TrimEnd('/')
+$WebUrl = $Sites -join ','
 
 if ($Port -lt 1 -or $Port -gt 65535) { Die "Port must be 1-65535 - got $Port" }
 
@@ -179,46 +186,50 @@ function Test-HubEndpoint {
 if ($SkipUrlCheck) {
     Write-Host "  Hub check   : skipped (-SkipUrlCheck)" -ForegroundColor Yellow
 } else {
-    $hub = Test-HubEndpoint $WebUrl
+    # Each site is checked on its own: one wrong URL in a list is as bad as
+    # one wrong URL alone.
+    foreach ($site in $Sites) {
+        $hub = Test-HubEndpoint $site
 
-    if ($hub.Status -ge 300 -and $hub.Status -lt 400) {
-        # The redirect target is the URL that actually works, so hand it over
-        # rather than making someone guess which scheme or host was meant.
-        $suggest = $WebUrl
-        if ($hub.Location -and $hub.Location -match '^https?://[^/]+') {
-            $suggest = $Matches[0]
-        } elseif ($WebUrl -like 'http://*') {
-            $suggest = $WebUrl -replace '^http://', 'https://'
+        if ($hub.Status -ge 300 -and $hub.Status -lt 400) {
+            # The redirect target is the URL that actually works, so hand it over
+            # rather than making someone guess which scheme or host was meant.
+            $suggest = $site
+            if ($hub.Location -and $hub.Location -match '^https?://[^/]+') {
+                $suggest = $Matches[0]
+            } elseif ($site -like 'http://*') {
+                $suggest = $site -replace '^http://', 'https://'
+            }
+            Write-Host "  Hub check   : REDIRECT (HTTP $($hub.Status))" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  $site redirects to $($hub.Location)" -ForegroundColor Yellow
+            Write-Host "  SignalR negotiates with a POST, and a redirect turns that into a GET," -ForegroundColor Yellow
+            Write-Host "  which the hub rejects with 405. The service would install cleanly and" -ForegroundColor Yellow
+            Write-Host "  then reconnect forever." -ForegroundColor Yellow
+            Write-Host ""
+            Die "Re-run with the URL the site actually serves:`n         INSTALL.bat $suggest`n`n       Use -SkipUrlCheck to install anyway."
         }
-        Write-Host "  Hub check   : REDIRECT (HTTP $($hub.Status))" -ForegroundColor Red
-        Write-Host ""
-        Write-Host "  $WebUrl redirects to $($hub.Location)" -ForegroundColor Yellow
-        Write-Host "  SignalR negotiates with a POST, and a redirect turns that into a GET," -ForegroundColor Yellow
-        Write-Host "  which the hub rejects with 405. The service would install cleanly and" -ForegroundColor Yellow
-        Write-Host "  then reconnect forever." -ForegroundColor Yellow
-        Write-Host ""
-        Die "Re-run with the URL the site actually serves:`n         INSTALL.bat $suggest`n`n       Use -SkipUrlCheck to install anyway."
-    }
-    elseif ($hub.Status -eq 200) {
-        Write-Host "  Hub check   : ok (negotiate answered 200)" -ForegroundColor Green
-    }
-    elseif ($hub.Status -eq 401 -or $hub.Status -eq 403) {
-        Write-Host "  Hub check   : reachable, but negotiate returned $($hub.Status)" -ForegroundColor Yellow
-        Write-Host "                The hub is there; it refused this unauthenticated probe." -ForegroundColor Yellow
-    }
-    elseif ($hub.Status -eq 404) {
-        Write-Host "  Hub check   : NO - no /scaleHub at $WebUrl (HTTP 404)" -ForegroundColor Yellow
-        Write-Host "                Right server, wrong app? The service will retry forever." -ForegroundColor Yellow
-        Write-Host "                Ctrl+C now if that URL is wrong." -ForegroundColor Yellow
-    }
-    elseif ($hub.Status -eq 0) {
-        Write-Host "  Hub check   : NO - $WebUrl did not answer within 10s." -ForegroundColor Yellow
-        Write-Host "                $($hub.Error)" -ForegroundColor Yellow
-        Write-Host "                The service will install and retry forever. If that URL is" -ForegroundColor Yellow
-        Write-Host "                wrong, Ctrl+C now and re-run with the right one." -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "  Hub check   : unexpected HTTP $($hub.Status) from negotiate" -ForegroundColor Yellow
+        elseif ($hub.Status -eq 200) {
+            Write-Host "  Hub check   : ok (negotiate answered 200)" -ForegroundColor Green
+        }
+        elseif ($hub.Status -eq 401 -or $hub.Status -eq 403) {
+            Write-Host "  Hub check   : reachable, but negotiate returned $($hub.Status)" -ForegroundColor Yellow
+            Write-Host "                The hub is there; it refused this unauthenticated probe." -ForegroundColor Yellow
+        }
+        elseif ($hub.Status -eq 404) {
+            Write-Host "  Hub check   : NO - no /scaleHub at $site (HTTP 404)" -ForegroundColor Yellow
+            Write-Host "                Right server, wrong app? The service will retry forever." -ForegroundColor Yellow
+            Write-Host "                Ctrl+C now if that URL is wrong." -ForegroundColor Yellow
+        }
+        elseif ($hub.Status -eq 0) {
+            Write-Host "  Hub check   : NO - $site did not answer within 10s." -ForegroundColor Yellow
+            Write-Host "                $($hub.Error)" -ForegroundColor Yellow
+            Write-Host "                The service will install and retry forever. If that URL is" -ForegroundColor Yellow
+            Write-Host "                wrong, Ctrl+C now and re-run with the right one." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  Hub check   : unexpected HTTP $($hub.Status) from negotiate" -ForegroundColor Yellow
+        }
     }
 }
 Write-Host ""
@@ -460,7 +471,7 @@ Write-Host "  Health     : http://localhost:$Port/api/status/health"
 Write-Host "  Diagnostic : http://localhost:$Port/api/diagnostic"
 Write-Host ""
 Write-Host "  Confirm it reached the web app - the scale should appear under"
-Write-Host "  Scale Management at $WebUrl/Scale"
+Write-Host "  Scale Management at $($Sites[0])/Scale"
 Write-Host ""
 if ($ResetDb) {
     Write-Host "  The database was reset, so there are no scales configured yet." -ForegroundColor Yellow

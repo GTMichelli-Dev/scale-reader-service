@@ -18,9 +18,15 @@ public class ScaleWorker : BackgroundService
     private readonly ScaleWeightStore _weightStore;
     private readonly BrandsCache _brands;
     private readonly GpioInputs _gpio;
-    private HubConnection? _connection;
     private string _serviceId = "default";
-    private string _serverUrl = "";
+
+    // Every Foundation site in ServerUrl (one or several, see ServerUrls) that
+    // is connected right now. A scale shared by several companies reads once
+    // and every site gets the weight; a request is answered on the
+    // connection it came in on.
+    private readonly List<SiteConnection> _sites = new();
+    private readonly object _sitesLock = new();
+    private sealed record SiteConnection(HubConnection Connection, string ServerUrl);
 
     /// <summary>This service's version, surfaced on the web app's scale screen so
     /// an operator can see what is deployed without remoting into the box.</summary>
@@ -81,7 +87,6 @@ public class ScaleWorker : BackgroundService
                     serverUrl = settings?.ServerUrl ?? "http://localhost:5110";
                     hubPath = settings?.SignalRHub ?? "/scaleHub";
                     _serviceId = settings?.ServiceId ?? "default";
-                    _serverUrl = serverUrl;
 
                     // Refresh brands cache so the local file mirrors the remote
                     // by the time the first SignalR client asks.
@@ -93,7 +98,9 @@ public class ScaleWorker : BackgroundService
 
                 _log.LogInformation("Loaded settings from database: ServiceId={ServiceId}, ServerUrl={Url}", _serviceId, serverUrl);
 
-                await ConnectAndRun(serverUrl, hubPath, stoppingToken);
+                // Returns once a restart (a scale or setting changed) has
+                // stopped the pollers and closed every site.
+                await RunAll(serverUrl, hubPath, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -101,71 +108,138 @@ public class ScaleWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _log.LogWarning("Connection lost. Reconnecting in 5 seconds... Error: {Msg}", ex.Message);
+                _log.LogWarning("Could not start: {Msg}. Retrying in 5 seconds...", ex.Message);
                 try { await Task.Delay(5000, stoppingToken); }
                 catch (OperationCanceledException) { break; }
-            }
-            finally
-            {
-                if (_connection != null)
-                {
-                    try { await _connection.DisposeAsync(); }
-                    catch { /* ignore cleanup errors */ }
-                    _connection = null;
-                }
             }
         }
     }
 
-    private async Task ConnectAndRun(string serverUrl, string hubPath, CancellationToken stoppingToken)
+    /// <summary>
+    /// The scale pollers and one connection per site, side by side. The pollers
+    /// don't wait on any site: the scale is read whether or not a site is
+    /// listening, and each weight goes to whichever sites are connected.
+    /// </summary>
+    private async Task RunAll(string serverUrlSetting, string hubPath, CancellationToken stoppingToken)
     {
-        _connection = new HubConnectionBuilder()
-            .WithUrl($"{serverUrl.TrimEnd('/')}{hubPath}")
-            .WithAutomaticReconnect(new ForeverRetryPolicy())
-            .Build();
+        foreach (var bad in ServerUrls.Rejected(serverUrlSetting))
+            _log.LogWarning("Ignoring \"{Entry}\" in ServerUrl: not an http:// or https:// address.", bad);
+        var sites = ServerUrls.Parse(serverUrlSetting);
+        if (sites.Count == 0)
+            throw new InvalidOperationException($"ServerUrl has no usable address (\"{serverUrlSetting}\").");
+        if (sites.Count > 1)
+            _log.LogInformation("Serving {Count} sites: {Sites}", sites.Count, string.Join(", ", sites));
 
-        _connection.Reconnecting += ex =>
-        {
-            _log.LogWarning("Connection lost. Reconnecting...");
-            return Task.CompletedTask;
-        };
-
-        _connection.Reconnected += async _ =>
-        {
-            _log.LogInformation("Reconnected. Rejoining scale groups...");
-            await JoinGroups();
-            await AnnounceScales();
-        };
-
-        // Register handlers for SignalR commands from the web app
-        RegisterHandlers();
-
-        _log.LogInformation("Connecting to {Url}{Hub}", serverUrl, hubPath);
-        await _connection.StartAsync(stoppingToken);
-        _log.LogInformation("Connected to server. Joining scale groups (ServiceId={ServiceId})...", _serviceId);
-
-        await JoinGroups();
-        _log.LogInformation("Joined scale groups. Starting scale pollers...");
-
-        await AnnounceScales();
-
-        // Start polling all active scales
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _restart.Token);
-        await PollScales(linked.Token);
+        var token = linked.Token;
+        await Task.WhenAll(sites.Select(site => RunSite(site, hubPath, token)).Append(PollScales(token)));
     }
 
-    private void RegisterHandlers()
+    /// <summary>
+    /// One site: connect, join, announce, then wait. A site that can't be
+    /// reached is tried again every 5 seconds without touching the others;
+    /// once connected, the connection reconnects on its own.
+    /// </summary>
+    private async Task RunSite(string serverUrl, string hubPath, CancellationToken token)
     {
+        while (!token.IsCancellationRequested)
+        {
+            HubConnection? connection = null;
+            try
+            {
+                connection = new HubConnectionBuilder()
+                    .WithUrl($"{serverUrl}{hubPath}")
+                    .WithAutomaticReconnect(new ForeverRetryPolicy())
+                    .Build();
+
+                var site = new SiteConnection(connection, serverUrl);
+                connection.Reconnecting += ex =>
+                {
+                    _log.LogWarning("Connection to {Url} lost. Reconnecting...", serverUrl);
+                    return Task.CompletedTask;
+                };
+
+                connection.Reconnected += async _ =>
+                {
+                    _log.LogInformation("Reconnected to {Url}. Rejoining scale groups...", serverUrl);
+                    await JoinGroups(connection);
+                    await AnnounceTo(site);
+                };
+
+                // Register handlers for SignalR commands from the web app
+                RegisterHandlers(site);
+
+                _log.LogInformation("Connecting to {Url}{Hub}", serverUrl, hubPath);
+                await connection.StartAsync(token);
+                lock (_sitesLock) _sites.Add(site);
+                _log.LogInformation("Connected to {Url}. Joining scale groups (ServiceId={ServiceId})...", serverUrl, _serviceId);
+
+                await JoinGroups(connection);
+                _log.LogInformation("Joined scale groups on {Url}.", serverUrl);
+
+                await AnnounceTo(site);
+
+                await Task.Delay(Timeout.Infinite, token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Connection to {Url} failed: {Msg}. Retrying in 5 seconds...", serverUrl, ex.Message);
+            }
+            finally
+            {
+                if (connection != null)
+                {
+                    lock (_sitesLock) _sites.RemoveAll(s => s.Connection == connection);
+                    try { await connection.DisposeAsync(); }
+                    catch { /* ignore cleanup errors */ }
+                }
+            }
+
+            if (token.IsCancellationRequested) break;
+            try { await Task.Delay(5000, token); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    /// <summary>
+    /// Sends to every connected site at once, so a slow or failing one doesn't
+    /// hold up the rest. A site that drops a message is left to its own
+    /// reconnect; the weight is not worth more than a debug line.
+    /// </summary>
+    private Task SendToAllSites(string method, object payload, CancellationToken ct)
+    {
+        List<HubConnection> connections;
+        lock (_sitesLock)
+            connections = _sites.Where(s => s.Connection.State == HubConnectionState.Connected)
+                .Select(s => s.Connection).ToList();
+        if (connections.Count == 0) return Task.CompletedTask;
+        return Task.WhenAll(connections.Select(async connection =>
+        {
+            try { await connection.InvokeAsync(method, payload, ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { _log.LogDebug("Could not send {Method}: {Msg}", method, ex.Message); }
+        }));
+    }
+
+    /// <summary>What a site may ask of this service. Every answer goes back on
+    /// that site's own connection.</summary>
+    private void RegisterHandlers(SiteConnection site)
+    {
+        var connection = site.Connection;
+
         // Web app can request the loaded brand definitions list. Each call refreshes
         // from the configured remote URL (and persists it to the local cache); on
         // failure the response carries Source="local" + Error so the UI can warn.
-        _connection!.On("GetScaleBrands", async () =>
+        connection.On("GetScaleBrands", async () =>
         {
             try
             {
                 var cache = _sp.GetRequiredService<BrandsCache>();
                 var result = await cache.RefreshAsync();
-                await _connection!.InvokeAsync("ScaleBrandsResponse", new
+                await connection.InvokeAsync("ScaleBrandsResponse", new
                 {
                     serviceId = _serviceId,
                     brands = result.Brands,
@@ -178,7 +252,7 @@ public class ScaleWorker : BackgroundService
         });
 
         // Web app can request scale list
-        _connection!.On("GetScaleList", async () =>
+        connection.On("GetScaleList", async () =>
         {
             try
             {
@@ -186,11 +260,11 @@ public class ScaleWorker : BackgroundService
                 var db = scope.ServiceProvider.GetRequiredService<ScaleDbContext>();
                 // Every scale, not just the active ones — see AnnounceScales.
                 var scales = await db.Scales.OrderBy(s => s.ScaleId).ToListAsync();
-                await _connection!.InvokeAsync("ScaleListResponse", new
+                await connection.InvokeAsync("ScaleListResponse", new
                 {
                     serviceId = _serviceId,
                     version = ServiceVersion,
-                    serverUrl = _serverUrl,
+                    serverUrl = site.ServerUrl,
                     scales = scales.Select(s => new
                     {
                         s.ScaleId, s.DisplayName, s.ScaleBrand,
@@ -211,11 +285,11 @@ public class ScaleWorker : BackgroundService
         });
 
         // Serial ports available on this machine, for the setup screen's port picker.
-        _connection!.On("GetSerialPorts", async () =>
+        connection.On("GetSerialPorts", async () =>
         {
             try
             {
-                await _connection!.InvokeAsync("ScaleSerialPortsResponse", new
+                await connection.InvokeAsync("ScaleSerialPortsResponse", new
                 {
                     serviceId = _serviceId,
                     ports = SerialScaleClient.ListPorts()
@@ -228,7 +302,7 @@ public class ScaleWorker : BackgroundService
         // typed into the Add/Edit Scale modal, capture a few seconds of the stream, and
         // report what the frames look like. Deliberately works from posted parameters
         // rather than the database — detection has to run before the scale is saved.
-        _connection!.On<string, System.Text.Json.JsonElement>("DetectFormat", (requestId, config) =>
+        connection.On<string, System.Text.Json.JsonElement>("DetectFormat", (requestId, config) =>
         {
             // Fire-and-forget on a worker thread: a wedged port must not block the
             // SignalR message pump, and the handler answers on every path so the
@@ -237,25 +311,25 @@ public class ScaleWorker : BackgroundService
             {
                 try
                 {
-                    await RunDetection(requestId, config);
+                    await RunDetection(connection, requestId, config);
                 }
                 catch (Exception ex)
                 {
                     _log.LogWarning("DetectFormat failed: {Msg}", ex.Message);
-                    await SafeDetectReply(requestId, new { ok = false, error = ex.Message });
+                    await SafeDetectReply(connection, requestId, new { ok = false, error = ex.Message });
                 }
             });
         });
 
         // Reload config command
-        _connection!.On("ReloadConfig", () =>
+        connection.On("ReloadConfig", () =>
         {
             _log.LogInformation("Received ReloadConfig command. Restarting...");
             _restart.TriggerRestart();
         });
 
         // Zero scale command
-        _connection!.On<string>("ZeroScale", async (scaleId) =>
+        connection.On<string>("ZeroScale", async (scaleId) =>
         {
             _log.LogInformation("Received ZeroScale command for scale: {ScaleId}", scaleId);
             try
@@ -287,7 +361,7 @@ public class ScaleWorker : BackgroundService
         });
 
         // CRUD: Add scale
-        _connection!.On<System.Text.Json.JsonElement>("AddScale", async (config) =>
+        connection.On<System.Text.Json.JsonElement>("AddScale", async (config) =>
         {
             try
             {
@@ -297,23 +371,23 @@ public class ScaleWorker : BackgroundService
                     new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                 if (entity == null || string.IsNullOrWhiteSpace(entity.ScaleId))
                 {
-                    await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = "Invalid scale data" });
+                    await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = "Invalid scale data" });
                     return;
                 }
                 entity.Id = 0;
                 db.Scales.Add(entity);
                 await db.SaveChangesAsync();
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale added: " + entity.ScaleId });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale added: " + entity.ScaleId });
                 _restart.TriggerRestart(); // restart to pick up new scale
             }
             catch (Exception ex)
             {
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
             }
         });
 
         // CRUD: Update scale
-        _connection!.On<string, System.Text.Json.JsonElement>("UpdateScale", async (scaleId, config) =>
+        connection.On<string, System.Text.Json.JsonElement>("UpdateScale", async (scaleId, config) =>
         {
             try
             {
@@ -322,7 +396,7 @@ public class ScaleWorker : BackgroundService
                 var existing = db.Scales.FirstOrDefault(s => s.ScaleId == scaleId);
                 if (existing == null)
                 {
-                    await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = "Scale not found: " + scaleId });
+                    await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = "Scale not found: " + scaleId });
                     return;
                 }
                 var update = System.Text.Json.JsonSerializer.Deserialize<ScaleConfigEntity>(config.GetRawText(),
@@ -365,17 +439,17 @@ public class ScaleWorker : BackgroundService
                     existing.Active = update.Active;
                 }
                 await db.SaveChangesAsync();
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale updated: " + scaleId });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale updated: " + scaleId });
                 _restart.TriggerRestart();
             }
             catch (Exception ex)
             {
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
             }
         });
 
         // CRUD: Delete scale
-        _connection!.On<string>("DeleteScale", async (scaleId) =>
+        connection.On<string>("DeleteScale", async (scaleId) =>
         {
             try
             {
@@ -384,25 +458,25 @@ public class ScaleWorker : BackgroundService
                 var existing = db.Scales.FirstOrDefault(s => s.ScaleId == scaleId);
                 if (existing == null)
                 {
-                    await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = "Scale not found: " + scaleId });
+                    await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = "Scale not found: " + scaleId });
                     return;
                 }
                 db.Scales.Remove(existing);
                 await db.SaveChangesAsync();
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale deleted: " + scaleId });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = true, message = "Scale deleted: " + scaleId });
                 _restart.TriggerRestart();
             }
             catch (Exception ex)
             {
-                await _connection!.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
+                await connection.InvokeAsync("ScaleCrudResult", new { success = false, message = ex.Message });
             }
         });
     }
 
-    private async Task JoinGroups()
+    private async Task JoinGroups(HubConnection connection)
     {
-        await _connection!.InvokeAsync("JoinScaleGroup", _serviceId);
-        await ReportVersion();
+        await connection.InvokeAsync("JoinScaleGroup", _serviceId);
+        await ReportVersion(connection);
     }
 
     /// <summary>
@@ -418,11 +492,11 @@ public class ScaleWorker : BackgroundService
     /// method and will fault the invocation. That must not take the connection
     /// down with it — reporting weights matters, reporting a version does not.
     /// </summary>
-    private async Task ReportVersion()
+    private async Task ReportVersion(HubConnection connection)
     {
         try
         {
-            await _connection!.InvokeAsync("ReportServiceVersion",
+            await connection.InvokeAsync("ReportServiceVersion",
                 "Scale reader", _serviceId, ServiceVersion, false);
         }
         catch (Exception ex)
@@ -431,9 +505,20 @@ public class ScaleWorker : BackgroundService
         }
     }
 
+    /// <summary>Announces the scales to every site connected now: a scale set
+    /// up from one site is read for all of them.</summary>
     private async Task AnnounceScales()
     {
-        if (_connection?.State != HubConnectionState.Connected) return;
+        List<SiteConnection> sites;
+        lock (_sitesLock) sites = _sites.ToList();
+        foreach (var site in sites)
+            await AnnounceTo(site);
+    }
+
+    private async Task AnnounceTo(SiteConnection site)
+    {
+        var connection = site.Connection;
+        if (connection.State != HubConnectionState.Connected) return;
 
         try
         {
@@ -449,11 +534,11 @@ public class ScaleWorker : BackgroundService
             // only offer live hardware filter on it themselves.
             var scales = await db.Scales.OrderBy(s => s.ScaleId).ToListAsync();
 
-            await _connection.InvokeAsync("ScaleServiceReady", new
+            await connection.InvokeAsync("ScaleServiceReady", new
             {
                 serviceId = _serviceId,
                 version = ServiceVersion,
-                serverUrl = _serverUrl,
+                serverUrl = site.ServerUrl,
                 // Still the number being polled, which is what this has always meant.
                 scaleCount = scales.Count(s => s.Active),
                 scales = scales.Select(s => new
@@ -494,7 +579,7 @@ public class ScaleWorker : BackgroundService
     /// layout. Answers on every path — success, no data, or failure — because the
     /// browser is sitting on a watchdog waiting for exactly one reply.
     /// </summary>
-    private async Task RunDetection(string requestId, System.Text.Json.JsonElement config)
+    private async Task RunDetection(HubConnection connection, string requestId, System.Text.Json.JsonElement config)
     {
         var probe = System.Text.Json.JsonSerializer.Deserialize<ScaleConfigEntity>(
             config.GetRawText(),
@@ -502,7 +587,7 @@ public class ScaleWorker : BackgroundService
 
         if (probe == null)
         {
-            await SafeDetectReply(requestId, new { ok = false, error = "Could not read the connection settings." });
+            await SafeDetectReply(connection, requestId, new { ok = false, error = "Could not read the connection settings." });
             return;
         }
 
@@ -531,7 +616,7 @@ public class ScaleWorker : BackgroundService
                 var who = holder.ScaleId == probe.ScaleId
                     ? "this scale is active, so its reader already holds the port"
                     : $"the active scale '{holder.ScaleId}' is using it";
-                await SafeDetectReply(requestId, new
+                await SafeDetectReply(connection, requestId, new
                 {
                     ok = false,
                     error = $"Serial port {probe.SerialPortName} is busy — {who}. "
@@ -551,7 +636,7 @@ public class ScaleWorker : BackgroundService
         }
         catch (Exception ex)
         {
-            await SafeDetectReply(requestId, new { ok = false, error = DescribeProbeFailure(ex, probe, isSerial) });
+            await SafeDetectReply(connection, requestId, new { ok = false, error = DescribeProbeFailure(ex, probe, isSerial) });
             return;
         }
 
@@ -577,14 +662,14 @@ public class ScaleWorker : BackgroundService
                       + "so no complete frame could be read. This usually means the baud rate, data bits or "
                       + $"parity is wrong. First bytes: {capture.RawSample}";
             }
-            await SafeDetectReply(requestId, new { ok = false, error });
+            await SafeDetectReply(connection, requestId, new { ok = false, error });
             return;
         }
 
         var brands = _brands.Get().Brands;
         var detection = ScaleFormatDetector.Detect(capture.Frames, brands);
 
-        await SafeDetectReply(requestId, new
+        await SafeDetectReply(connection, requestId, new
         {
             ok = true,
             serviceId = _serviceId,
@@ -614,12 +699,12 @@ public class ScaleWorker : BackgroundService
     /// Reply helper that never throws. If the hub connection dropped mid-detect there
     /// is nobody to tell, and an exception here would escape onto a background task.
     /// </summary>
-    private async Task SafeDetectReply(string requestId, object payload)
+    private async Task SafeDetectReply(HubConnection connection, string requestId, object payload)
     {
         try
         {
-            if (_connection?.State != HubConnectionState.Connected) return;
-            await _connection.InvokeAsync("ScaleFormatDetectResult", new
+            if (connection.State != HubConnectionState.Connected) return;
+            await connection.InvokeAsync("ScaleFormatDetectResult", new
             {
                 requestId,
                 serviceId = _serviceId,
@@ -908,23 +993,20 @@ public class ScaleWorker : BackgroundService
                 if (now < nextBroadcast) continue;
                 nextBroadcast = now.AddMilliseconds(scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 250);
 
-                if (_connection?.State == HubConnectionState.Connected)
+                await SendToAllSites("ScaleWeight", new
                 {
-                    await _connection.InvokeAsync("ScaleWeight", new
-                    {
-                        serviceId = _serviceId,
-                        scaleId = scale.ScaleId,
-                        displayName = scale.DisplayName,
-                        weight = frame.Weight,
-                        motion = frame.Motion,
-                        ok = frame.Ok,
-                        status = frame.Status,
-                        onScale = IsOnScale(scale),
-                        rawResponse = frame.RawText,
-                        rawHex = frame.RawHex,
-                        lastUpdate = DateTime.Now
-                    }, ct);
-                }
+                    serviceId = _serviceId,
+                    scaleId = scale.ScaleId,
+                    displayName = scale.DisplayName,
+                    weight = frame.Weight,
+                    motion = frame.Motion,
+                    ok = frame.Ok,
+                    status = frame.Status,
+                    onScale = IsOnScale(scale),
+                    rawResponse = frame.RawText,
+                    rawHex = frame.RawHex,
+                    lastUpdate = DateTime.Now
+                }, ct);
             }
             pending.Clear();
             pending.Append(text);
@@ -967,23 +1049,20 @@ public class ScaleWorker : BackgroundService
                     if (now < nextBroadcast) return;
                     nextBroadcast = now.AddMilliseconds(scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 250);
 
-                    if (_connection?.State == HubConnectionState.Connected)
+                    await SendToAllSites("ScaleWeight", new
                     {
-                        await _connection.InvokeAsync("ScaleWeight", new
-                        {
-                            serviceId = _serviceId,
-                            scaleId = scale.ScaleId,
-                            displayName = scale.DisplayName,
-                            weight = frame.Weight,
-                            motion = frame.Motion,
-                            ok = frame.Ok,
-                            status = frame.Status,
-                            onScale = IsOnScale(scale),
-                            rawResponse = frame.RawText,
-                            rawHex = frame.RawHex,
-                            lastUpdate = DateTime.Now
-                        }, ct);
-                    }
+                        serviceId = _serviceId,
+                        scaleId = scale.ScaleId,
+                        displayName = scale.DisplayName,
+                        weight = frame.Weight,
+                        motion = frame.Motion,
+                        ok = frame.Ok,
+                        status = frame.Status,
+                        onScale = IsOnScale(scale),
+                        rawResponse = frame.RawText,
+                        rawHex = frame.RawHex,
+                        lastUpdate = DateTime.Now
+                    }, ct);
                 };
 
                 if (isOnDemand)
@@ -1038,23 +1117,20 @@ public class ScaleWorker : BackgroundService
             LastUpdate = DateTime.Now
         });
 
-        if (_connection?.State == HubConnectionState.Connected)
+        await SendToAllSites("ScaleWeight", new
         {
-            await _connection.InvokeAsync("ScaleWeight", new
-            {
-                serviceId = _serviceId,
-                scaleId = scale.ScaleId,
-                displayName = scale.DisplayName,
-                weight,
-                motion,
-                ok,
-                status,
-                onScale = IsOnScale(scale),
-                rawResponse = rawText,
-                rawHex,
-                lastUpdate = DateTime.Now
-            }, ct);
-        }
+            serviceId = _serviceId,
+            scaleId = scale.ScaleId,
+            displayName = scale.DisplayName,
+            weight,
+            motion,
+            ok,
+            status,
+            onScale = IsOnScale(scale),
+            rawResponse = rawText,
+            rawHex,
+            lastUpdate = DateTime.Now
+        }, ct);
     }
 
     private async Task PublishDisconnected(ScaleConfigEntity scale, CancellationToken ct)
@@ -1070,34 +1146,33 @@ public class ScaleWorker : BackgroundService
             LastUpdate = DateTime.Now
         });
 
-        if (_connection?.State == HubConnectionState.Connected)
+        try
         {
-            try
+            await SendToAllSites("ScaleWeight", new
             {
-                await _connection.InvokeAsync("ScaleWeight", new
-                {
-                    serviceId = _serviceId,
-                    scaleId = scale.ScaleId,
-                    displayName = scale.DisplayName,
-                    weight = 0,
-                    motion = false,
-                    ok = false,
-                    status = "Disconnected",
-                    // A dead feed has no detector opinion worth acting on, and
-                    // the scale error stops the weighment on its own.
-                    onScale = true,
-                    lastUpdate = DateTime.Now
-                }, ct);
-            }
-            catch { /* ignore */ }
+                serviceId = _serviceId,
+                scaleId = scale.ScaleId,
+                displayName = scale.DisplayName,
+                weight = 0,
+                motion = false,
+                ok = false,
+                status = "Disconnected",
+                // A dead feed has no detector opinion worth acting on, and
+                // the scale error stops the weighment on its own.
+                onScale = true,
+                lastUpdate = DateTime.Now
+            }, ct);
         }
+        catch { /* ignore */ }
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_connection != null)
+        List<SiteConnection> sites;
+        lock (_sitesLock) sites = _sites.ToList();
+        foreach (var site in sites)
         {
-            try { await _connection.DisposeAsync(); }
+            try { await site.Connection.DisposeAsync(); }
             catch { /* ignore */ }
         }
         await base.StopAsync(cancellationToken);
