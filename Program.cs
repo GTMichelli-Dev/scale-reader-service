@@ -122,6 +122,8 @@ using (var scope = app.Services.CreateScope())
     // Defaults to on: a dry contact is the common case, and a sensor that
     // drives both states is unaffected by the pull-up.
     AddColumnIfMissing(db, "Scales", "DetectorPullUp", "INTEGER NOT NULL DEFAULT 1");
+    AddColumnIfMissing(db, "Scales", "SdsUsername", "TEXT NULL");
+    AddColumnIfMissing(db, "Scales", "SdsPassword", "TEXT NULL");
 
     // Seed from appsettings.json if no scales exist yet
     if (!db.Scales.Any())

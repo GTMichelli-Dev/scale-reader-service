@@ -61,6 +61,18 @@ public class ScaleBrandDefinition
     [JsonPropertyName("sdsSharedDataName")]
     public string? SdsSharedDataName { get; set; }
 
+    /// <summary>
+    /// Shared Data Server field names (protocol "SDS"). Gross defaults to "wt0101"
+    /// and units to "wt0103" when omitted. Status fields are optional, read as
+    /// "1" = active, and left out when the terminal's reference documents none.
+    /// </summary>
+    [JsonPropertyName("sdsFields")]
+    public SdsFieldMap? SdsFields { get; set; }
+
+    /// <summary>Shows the terminal user/password fields on the web app's scale setup.</summary>
+    [JsonPropertyName("requiresLogin")]
+    public bool? RequiresLogin { get; set; }
+
     /// <summary>Regex to extract weight (and unit) from the response line.</summary>
     [JsonPropertyName("weightRegex")]
     public string? WeightRegex { get; set; }
@@ -137,6 +149,19 @@ public class ScaleBrandDefinition
             return new List<ScaleBrandDefinition>();
         }
     }
+}
+
+/// <summary>Shared-data field names for a Mettler Toledo Shared Data Server scale.</summary>
+public class SdsFieldMap
+{
+    [JsonPropertyName("gross")] public string? Gross { get; set; }
+    [JsonPropertyName("units")] public string? Units { get; set; }
+    [JsonPropertyName("motion")] public string? Motion { get; set; }
+    [JsonPropertyName("centerOfZero")] public string? CenterOfZero { get; set; }
+    [JsonPropertyName("overCapacity")] public string? OverCapacity { get; set; }
+    [JsonPropertyName("underZero")] public string? UnderZero { get; set; }
+    /// <summary>Command trigger written "=1" to zero the scale (IND700: wc0104). Blank = no remote zero.</summary>
+    [JsonPropertyName("zero")] public string? Zero { get; set; }
 }
 
 /// <summary>

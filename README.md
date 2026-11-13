@@ -60,6 +60,31 @@ Typical hookup for a Condec UMC indicator streaming continuously at 9600,8,N,1:
 for every parsed reading, plus loud warnings when the port is silent (wrong
 port/baud) or frames don't parse (wrong protocol/brand).
 
+## Mettler Toledo Shared Data Server (IND700 / IND560 / IND570 / IND780)
+
+Pick **Mettler Toledo — Shared Data Services (SDS)** on the scale setup screen,
+enter the terminal's IP (port 1701), and the **Terminal User / Password** that
+appear for that brand. Per the IND700 Shared Data Reference, the service logs
+in once (`user` → `51 Enter Password`, `pass` → `12 Access OK`), holds the
+session open and sends `read wt0101 wt0103` (displayed gross weight, units)
+every poll interval. Replies are `00R<seq>~value~value~`; `99…` is a failure.
+
+- **Status:** the reference documents no motion / center-of-zero /
+  over-capacity fields, so out of the box a reading is `Ok`, or `Error` when the
+  displayed gross isn't a number (dashes when over/under range). If a
+  terminal does expose them, add `motion` / `centerOfZero` / `overCapacity` /
+  `underZero` to `sdsFields` (read as 1 = active). If the terminal rejects one,
+  the service logs it and falls back to gross/units only.
+- **Zero:** writes `wc0104=1` (pushbutton zero) on its own short session. The
+  login needs Operator write access or above.
+- Field names come from `sdsFields` in the brand definition
+  (device-definitions), so they can be corrected without a new build. Instance
+  `01` is scale 1. Use `wt0201` etc. for a second platform.
+- Leave the user blank for a terminal with security turned off.
+- The password is stored in the service's SQLite DB and is write-only: the web
+  app and `/api/scales` only ever see whether one is saved. On edit, a blank
+  password keeps the saved one.
+
 ## Auto-detect and stream tokens
 
 Commissioning an indicator nobody has written a `weightRegex` for used to mean

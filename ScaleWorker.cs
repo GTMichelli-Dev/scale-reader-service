@@ -277,6 +277,8 @@ public class ScaleWorker : BackgroundService
                         s.FrameWeightStart, s.FrameWeightEnd,
                         s.FrameMotionIndex, s.FrameMotionChar,
                         s.FrameSignIndex, s.FrameSignNegChar,
+                        s.SdsUsername,
+                        hasSdsPassword = !string.IsNullOrEmpty(s.SdsPassword),
                         s.Active
                     })
                 });
@@ -340,6 +342,27 @@ public class ScaleWorker : BackgroundService
                 if (scale == null)
                 {
                     _log.LogWarning("ZeroScale: Scale '{ScaleId}' not found or inactive", scaleId);
+                    return;
+                }
+
+                if (string.Equals(scale.Protocol, "SDS", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Shared Data Server: zero is a command trigger — write 1 to the
+                    // pushbutton-zero field (IND700 wc0104) on a short-lived session of
+                    // its own, so it never interleaves with the poller's reads.
+                    var zeroField = _brands.FindByKey(scale.ScaleBrand)?.SdsFields?.Zero;
+                    if (string.IsNullOrWhiteSpace(zeroField))
+                    {
+                        _log.LogWarning("ZeroScale: no sdsFields.zero for '{Brand}' in device-definitions; zero '{ScaleId}' from the terminal.",
+                            scale.ScaleBrand, scaleId);
+                        return;
+                    }
+                    using var zcts = new CancellationTokenSource(Math.Max(scale.TimeoutMs, 1000) * 3);
+                    await using var zs = await SdsSession.ConnectAsync(
+                        scale.IpAddress, scale.Port, scale.SdsUsername, scale.SdsPassword, scale.TimeoutMs, zcts.Token);
+                    var reply = await zs.WriteAsync(zeroField.Trim(), "1", zcts.Token);
+                    _log.LogInformation("ZeroScale: wrote {Field}=1 to {ScaleId} at {Ip}:{Port} → {Reply}",
+                        zeroField, scaleId, scale.IpAddress, scale.Port, reply);
                     return;
                 }
 
@@ -435,6 +458,13 @@ public class ScaleWorker : BackgroundService
                     existing.EndDetectorPin2 = update.EndDetectorPin2;
                     existing.InvertDetectorPins = update.InvertDetectorPins;
                     existing.DetectorPullUp = update.DetectorPullUp;
+
+                    // The password is never sent to the browser, so an edit that
+                    // leaves the box blank must keep the stored one. Null keeps it;
+                    // an explicit "" clears it.
+                    existing.SdsUsername = string.IsNullOrWhiteSpace(update.SdsUsername) ? null : update.SdsUsername.Trim();
+                    if (update.SdsPassword != null)
+                        existing.SdsPassword = update.SdsPassword.Length == 0 ? null : update.SdsPassword;
 
                     existing.Active = update.Active;
                 }
@@ -555,6 +585,8 @@ public class ScaleWorker : BackgroundService
                     s.FrameSignIndex, s.FrameSignNegChar,
                     s.EndDetectorPin1, s.EndDetectorPin2,
                     s.InvertDetectorPins, s.DetectorPullUp,
+                    s.SdsUsername,
+                    hasSdsPassword = !string.IsNullOrEmpty(s.SdsPassword),
                     s.Active
                 })
             });
@@ -823,10 +855,22 @@ public class ScaleWorker : BackgroundService
         bool isStreaming = string.Equals(scale.Protocol, "Continuous", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(scale.Protocol, "Stream", StringComparison.OrdinalIgnoreCase);
 
+        // Mettler Toledo Shared Data Server: log in once, then poll the gross and
+        // status fields on the held-open session.
+        bool isSds = string.Equals(scale.Protocol, "SDS", StringComparison.OrdinalIgnoreCase);
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
+                if (isSds)
+                {
+                    await PollSdsScale(scale, ct);
+                    backoff = 2000;
+                    await Task.Delay(1000, ct);
+                    continue;
+                }
+
                 if (isStreaming)
                 {
                     await StreamTcpScale(scale, ct);
@@ -901,6 +945,65 @@ public class ScaleWorker : BackgroundService
                 catch (OperationCanceledException) { break; }
                 backoff = Math.Min(backoff * 2, maxBackoff);
             }
+        }
+    }
+
+    /// <summary>
+    /// Polls a Mettler Toledo terminal's Shared Data Server. One session per
+    /// connection: connect, log in with the scale's terminal credentials, then
+    /// "read" the gross + status fields every PollingIntervalMs until the socket
+    /// drops or a read fails — at which point the exception goes to the caller's
+    /// backoff/reconnect handling, which publishes "Disconnected".
+    /// </summary>
+    private async Task PollSdsScale(ScaleConfigEntity scale, CancellationToken ct)
+    {
+        // The field map lives in the brand definition. The cache is warmed in the
+        // background at startup, so on a cold start fetch it before falling back to
+        // the built-in gross/units defaults (which carry no status fields).
+        var brand = _brands.FindByKey(scale.ScaleBrand);
+        if (brand == null)
+        {
+            await _brands.RefreshAsync();
+            brand = _brands.FindByKey(scale.ScaleBrand);
+        }
+        var plan = SdsReading.BuildPlan(brand);
+
+        await using var session = await SdsSession.ConnectAsync(
+            scale.IpAddress, scale.Port, scale.SdsUsername, scale.SdsPassword, scale.TimeoutMs, ct);
+
+        _log.LogInformation("Shared Data session open for scale '{ScaleId}' at {Ip}:{Port}{User} — reading {Fields}. Greeting: {Greeting}",
+            scale.ScaleId, scale.IpAddress, scale.Port,
+            string.IsNullOrWhiteSpace(scale.SdsUsername) ? " (no login)" : $" as '{scale.SdsUsername}'",
+            string.Join(' ', plan.Fields), session.Greeting ?? "(none)");
+
+        while (!ct.IsCancellationRequested)
+        {
+            string raw;
+            string[] values;
+            try
+            {
+                (raw, values) = await session.ReadAsync(plan.Fields, ct);
+            }
+            catch (SdsException ex) when (plan.HasStatus)
+            {
+                // A status field the terminal doesn't know (field names vary between
+                // IND models/firmware) must not take the whole scale offline. Keep
+                // reading the weight and say which field to fix in device-definitions.
+                _log.LogWarning("Scale '{ScaleId}': terminal rejected the status fields ({Fields}): {Msg}. " +
+                    "Falling back to gross/units only — check sdsFields for '{Brand}' in device-definitions.",
+                    scale.ScaleId, string.Join(' ', plan.Fields), ex.Message, scale.ScaleBrand);
+                plan = SdsReading.WeightOnly(plan);
+                continue;
+            }
+            var (weight, motion, ok, status) = SdsReading.Interpret(plan, values);
+            if (status == "Error")
+                _log.LogWarning("Scale '{ScaleId}' gross field {Field} is not a number: '{Raw}'",
+                    scale.ScaleId, plan.Fields[plan.GrossIndex], raw);
+
+            await PublishReading(scale, weight, motion, ok, status, raw,
+                BitConverter.ToString(Encoding.ASCII.GetBytes(raw)), ct);
+
+            await Task.Delay(scale.PollingIntervalMs > 0 ? scale.PollingIntervalMs : 750, ct);
         }
     }
 

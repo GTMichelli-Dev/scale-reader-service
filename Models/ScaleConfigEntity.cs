@@ -59,6 +59,16 @@ public class ScaleConfigEntity
     /// <summary>Serial stop bits: 1, 2, or 0 for OnePointFive (default 1)</summary>
     public int StopBits { get; set; } = 1;
 
+    // ---- Shared Data Server login (Mettler Toledo, protocol "SDS") ----
+
+    /// <summary>Terminal user name for the Shared Data Server. Blank = terminal has no security, skip login.</summary>
+    [StringLength(50)]
+    public string? SdsUsername { get; set; }
+
+    /// <summary>Terminal password. Never sent back to the web app — only a has-password flag is.</summary>
+    [StringLength(100)]
+    public string? SdsPassword { get; set; }
+
     // ---- Common ----
 
     /// <summary>Custom request command override (e.g. "W\r\n"). If empty, uses brand default. Ignored for streaming protocols.</summary>
@@ -132,4 +142,7 @@ public class ScaleConfigEntity
     /// when the sensor drives both states itself.
     /// </summary>
     public bool DetectorPullUp { get; set; } = true;
+
+    /// <summary>Shallow copy, e.g. to redact an API response without touching a tracked entity.</summary>
+    public ScaleConfigEntity Clone() => (ScaleConfigEntity)MemberwiseClone();
 }

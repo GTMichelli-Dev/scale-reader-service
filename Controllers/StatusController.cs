@@ -120,8 +120,8 @@ public class StatusController : Controller
     [HttpGet("api/scales")]
     public IActionResult GetAll()
     {
-        var scales = _db.Scales.OrderBy(s => s.ScaleId).ToList();
-        return Ok(scales);
+        var scales = _db.Scales.AsNoTracking().OrderBy(s => s.ScaleId).ToList();
+        return Ok(scales.Select(Redact));
     }
 
     [HttpGet("api/scales/{scaleId}")]
@@ -129,7 +129,7 @@ public class StatusController : Controller
     {
         var scale = _db.Scales.AsNoTracking().FirstOrDefault(s => s.ScaleId == scaleId);
         if (scale == null) return NotFound();
-        return Ok(scale);
+        return Ok(Redact(scale));
     }
 
     [HttpPost("api/scales")]
@@ -148,7 +148,7 @@ public class StatusController : Controller
         var announce = HttpContext.RequestServices.GetService<AnnounceSignal>();
         announce?.TriggerAnnounce();
 
-        return Created($"/api/scales/{scale.ScaleId}", scale);
+        return Created($"/api/scales/{scale.ScaleId}", Redact(scale.Clone()));
     }
 
     [HttpPut("api/scales/{scaleId}")]
@@ -173,13 +173,26 @@ public class StatusController : Controller
         existing.TimeoutMs = update.TimeoutMs > 0 ? update.TimeoutMs : existing.TimeoutMs;
         existing.Active = update.Active;
 
+        // Password: null keeps the stored one (it is never returned by GET), "" clears it.
+        existing.SdsUsername = string.IsNullOrWhiteSpace(update.SdsUsername) ? null : update.SdsUsername.Trim();
+        if (update.SdsPassword != null)
+            existing.SdsPassword = update.SdsPassword.Length == 0 ? null : update.SdsPassword;
+
         _db.SaveChanges();
 
         var announce = HttpContext.RequestServices.GetService<AnnounceSignal>();
         announce?.TriggerAnnounce();
 
-        return Ok(existing);
+        return Ok(Redact(existing.Clone()));
     }
+
+    /// <summary>The terminal password is write-only through the API.</summary>
+    private static ScaleConfigEntity Redact(ScaleConfigEntity s)
+    {
+        s.SdsPassword = string.IsNullOrEmpty(s.SdsPassword) ? null : "********";
+        return s;
+    }
+
 
     [HttpDelete("api/scales/{scaleId}")]
     public IActionResult Delete(string scaleId)

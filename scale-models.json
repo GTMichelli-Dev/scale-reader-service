@@ -244,8 +244,14 @@
     "type": "TCP",
     "defaultPort": 1701,
     "protocol": "SDS",
-    "sdsSharedDataName": "Weight.Net",
-    "weightRegex": "([+-]?\\d+\\.?\\d*)",
-    "notes": "Mettler Toledo Shared Data Services (SDS) protocol. Connects to InTouch or IND terminals running SDS server on port 1701. Subscribe to shared data items like 'Weight.Net', 'Weight.Gross', 'Weight.Tare'. Requires MT-SICS or SDS client implementation."
+    "requiresLogin": true,
+    "sdsFields": {
+      "gross": "wt0101",
+      "units": "wt0103",
+      "zero": "wc0104"
+    },
+    "responseFormat": "read <field> <field> ... -> 00R<seq>~<value>~<value>~ (00 = success, 99 = failure)",
+    "responseExample": "00R003~ 17.08~lb~",
+    "notes": "Mettler Toledo IND700 (and IND560 / IND570 / IND780) terminals via the Shared Data Server, TCP 1701. The service logs in with the terminal user/password set on the scale (user <name> -> 12 Access OK or 51 Enter Password; pass <password>), keeps the session open and polls wt0101 (displayed gross weight) and wt0103 (units) every poll interval. Zero writes wc0104=1 (pushbutton zero), which needs a user with Operator write access or above. The IND700 Shared Data Reference does not document motion / center-of-zero / over-capacity fields; if your terminal has them, add motion / centerOfZero / overCapacity / underZero to sdsFields (read as 1 = active). A non-numeric gross (dashes when over/under range) is reported as Error. Field instance 01 = scale 1; use wt0201 etc. for scale 2."
   }
 ]
